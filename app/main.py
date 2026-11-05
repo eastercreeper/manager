@@ -67,7 +67,8 @@ def db() -> sqlite3.Connection:
     CREATE TABLE IF NOT EXISTS episodes (
       id INTEGER PRIMARY KEY, anime_id INTEGER NOT NULL REFERENCES anime(id) ON DELETE CASCADE,
       season INTEGER, episode INTEGER, title TEXT, air_date TEXT, status TEXT NOT NULL DEFAULT 'expected',
-      jellyfin_id TEXT, UNIQUE(anime_id, season, episode)
+      jellyfin_id TEXT, jellyfin_path TEXT, filesystem_path TEXT, has_file BOOLEAN NOT NULL DEFAULT 0,
+      UNIQUE(anime_id, season, episode)
     );
     CREATE TABLE IF NOT EXISTS releases (
       id INTEGER PRIMARY KEY, anime_id INTEGER NOT NULL REFERENCES anime(id) ON DELETE CASCADE,
@@ -98,6 +99,14 @@ def db() -> sqlite3.Connection:
       status TEXT NOT NULL, message TEXT
     );
     """)
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(episodes)")}
+    for name, definition in (
+        ("jellyfin_path", "TEXT"),
+        ("filesystem_path", "TEXT"),
+        ("has_file", "BOOLEAN NOT NULL DEFAULT 0"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE episodes ADD COLUMN {name} {definition}")
     conn.commit()
     return conn
 
@@ -122,11 +131,39 @@ def safe_folder(name: str) -> str:
 
 
 def map_jellyfin_path(path: str) -> Path:
-    for mapping in JELLYFIN_PATH_PREFIXES:
+    mappings = list(JELLYFIN_PATH_PREFIXES)
+    if not any(path == mapping.split("=", 1)[0] or path.startswith(mapping.split("=", 1)[0].rstrip("/") + "/")
+               for mapping in mappings):
+        mappings.append("/ivan/Shows=/ivan/Shows")
+    for mapping in sorted(mappings, key=lambda value: len(value.split("=", 1)[0]), reverse=True):
         source, target = mapping.split("=", 1) if isinstance(mapping, str) else mapping
         if path == source or path.startswith(source.rstrip("/") + "/"):
             return Path(target) / path[len(source):].lstrip("/")
     return Path(path)
+
+
+VIDEO_SUFFIXES = {".mkv", ".mp4", ".avi", ".webm", ".m4v", ".ts"}
+
+
+def normalize_title(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def scan_series_files(series_path: Path) -> dict[tuple[int, int], Path]:
+    files: dict[tuple[int, int], Path] = {}
+    if not series_path.is_dir():
+        return files
+    pattern = re.compile(r"(?:s(\d{1,2})\s*e(\d{1,3})|\b(\d{1,3})\b)", re.IGNORECASE)
+    for path in series_path.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in VIDEO_SUFFIXES:
+            continue
+        match = pattern.search(path.stem)
+        if not match:
+            continue
+        season = int(match.group(1) or 1)
+        episode = int(match.group(2) or match.group(3))
+        files.setdefault((season, episode), path)
+    return files
 
 
 class JellyfinClient:
@@ -136,36 +173,51 @@ class JellyfinClient:
                 url = url or setting(conn, "jellyfin_url")
                 api_key = api_key or setting(conn, "jellyfin_api_key")
         self.url, self.api_key = url.rstrip("/"), api_key
+        if self.url and urllib.parse.urlparse(self.url).scheme not in {"http", "https"}:
+            raise ValueError("Jellyfin URL must use http or https")
 
     def request(self, method: str, path: str, **kwargs: Any) -> Any:
         if not self.url or not self.api_key:
             raise RuntimeError("Jellyfin is not configured")
         headers = kwargs.pop("headers", {})
         headers["X-Emby-Token"] = self.api_key
+        headers.setdefault("Accept", "application/json")
         response = requests.request(method, self.url + path, headers=headers, timeout=20, **kwargs)
         response.raise_for_status()
         return response.json() if response.content else None
 
     def libraries(self) -> list[dict]:
-        return self.request("GET", "/Library/VirtualFolders")
+        payload = self.request("GET", "/Library/VirtualFolders")
+        return payload if isinstance(payload, list) else payload.get("Items", [])
 
     def shows_library(self) -> Optional[dict]:
+        candidates = []
         for library in self.libraries():
-            if library.get("CollectionType") == "tvshows" or library.get("Name", "").lower() == "shows":
+            collection_type = (library.get("CollectionType") or "").lower()
+            name = (library.get("Name") or "").lower()
+            if collection_type in {"tvshows", "tv shows"}:
                 return library
-        return None
+            if name in {"shows", "anime"}:
+                candidates.append(library)
+        return candidates[0] if candidates else None
 
     def series(self) -> list[dict]:
         library = self.shows_library()
         if not library:
             return []
-        params = {"ParentId": library.get("ItemId"), "IncludeItemTypes": "Series",
-                  "Recursive": "true", "Fields": "ProviderIds,Path,PremiereDate,Overview,Genres"}
-        return self.request("GET", "/Items", params=params).get("Items", [])
+        parent_id = library.get("ItemId") or library.get("Id")
+        params = {"IncludeItemTypes": "Series",
+                  "Recursive": "true",
+                  "Fields": "ProviderIds,Path,PremiereDate,Overview,Genres,OriginalTitle,SortName"}
+        if parent_id:
+            params["ParentId"] = parent_id
+        payload = self.request("GET", "/Items", params=params)
+        return payload.get("Items", []) if isinstance(payload, dict) else []
 
     def episodes(self, series_id: str) -> list[dict]:
-        return self.request("GET", "/Shows/" + series_id + "/Episodes",
-                            params={"UserId": "", "Fields": "Path,ProviderIds,PremiereDate"}).get("Items", [])
+        payload = self.request("GET", "/Shows/" + series_id + "/Episodes",
+                               params={"Fields": "Path,ProviderIds,PremiereDate"})
+        return payload.get("Items", []) if isinstance(payload, dict) else []
 
     def refresh(self) -> None:
         self.request("POST", "/Library/Refresh")
@@ -322,14 +374,25 @@ def sync_jellyfin() -> int:
     count = 0
     for item in client.series():
         title = item.get("Name", "Unknown")
-        folder = safe_folder(Path(map_jellyfin_path(item.get("Path", title))).name or title)
+        reported_path = item.get("Path", "")
+        mapped_series_path = map_jellyfin_path(reported_path) if reported_path else Path("")
+        folder = safe_folder(mapped_series_path.name or title)
         provider_ids = item.get("ProviderIds") or {}
         with DB_LOCK, closing(db()) as conn:
+            normalized = normalize_title(title)
             row = conn.execute("SELECT id FROM anime WHERE jellyfin_id=?", (item.get("Id"),)).fetchone()
+            if not row:
+                row = conn.execute(
+                    "SELECT id FROM anime WHERE lower(title)=lower(?) OR lower(folder_name)=lower(?) "
+                    "ORDER BY jellyfin_id IS NULL DESC LIMIT 1", (title, folder)
+                ).fetchone()
             if row:
                 anime_id = row["id"]
-                conn.execute("UPDATE anime SET title=?, folder_name=?, updated_at=? WHERE id=?",
-                             (title, folder, now(), anime_id))
+                conn.execute("""UPDATE anime SET title=?, folder_name=?, search_query=?, jellyfin_id=?,
+                    year=?, metadata_json=?, updated_at=? WHERE id=?""",
+                             (title, folder, title, item.get("Id"),
+                              (item.get("PremiereDate") or "")[:4] or None,
+                              json.dumps(item), now(), anime_id))
             else:
                 cur = conn.execute("""INSERT INTO anime(title,folder_name,search_query,jellyfin_id,year,metadata_json,created_at,updated_at)
                     VALUES(?,?,?,?,?,?,?,?)""",
@@ -339,13 +402,37 @@ def sync_jellyfin() -> int:
             for provider, value in provider_ids.items():
                 conn.execute("INSERT OR IGNORE INTO provider_ids(anime_id,provider,value) VALUES(?,?,?)",
                              (anime_id, provider, value))
+            alternate_titles = list(item.get("AlternateTitles") or [])
+            alternate_titles.extend(
+                value for value in (item.get("OriginalTitle"), item.get("SortName"))
+                if value
+            )
+            if isinstance(alternate_titles, list):
+                for alternate in alternate_titles:
+                    alternate_value = alternate if isinstance(alternate, str) else alternate.get("Title")
+                    if alternate_value and normalize_title(alternate_value) != normalized:
+                        conn.execute("INSERT OR IGNORE INTO alternate_titles(anime_id,title,language) VALUES(?,?,?)",
+                                     (anime_id, alternate_value, alternate.get("Language") if isinstance(alternate, dict) else None))
+            physical_files = scan_series_files(mapped_series_path) if mapped_series_path.is_absolute() else {}
             for episode in client.episodes(item["Id"]):
                 season = episode.get("ParentIndexNumber")
                 number = episode.get("IndexNumber")
                 if number is not None:
-                    conn.execute("""INSERT INTO episodes(anime_id,season,episode,title,status,jellyfin_id)
-                        VALUES(?,?,?,?,?,?) ON CONFLICT(anime_id,season,episode) DO UPDATE SET jellyfin_id=excluded.jellyfin_id,status='available'""",
-                                 (anime_id, season, number, episode.get("Name"), "available", episode.get("Id")))
+                    physical = physical_files.get((season or 1, number))
+                    conn.execute("""INSERT INTO episodes(
+                        anime_id,season,episode,title,status,jellyfin_id,jellyfin_path,filesystem_path,has_file
+                    ) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(anime_id,season,episode) DO UPDATE SET
+                        title=excluded.title,jellyfin_id=excluded.jellyfin_id,jellyfin_path=excluded.jellyfin_path,
+                        filesystem_path=excluded.filesystem_path,has_file=excluded.has_file,
+                        status=CASE WHEN excluded.has_file OR excluded.jellyfin_id IS NOT NULL THEN 'available' ELSE episodes.status END""",
+                                 (anime_id, season or 1, number, episode.get("Name"),
+                                  "available", episode.get("Id"), episode.get("Path"),
+                                  str(physical) if physical else None, bool(physical or episode.get("Path"))))
+            for (season, number), physical in physical_files.items():
+                conn.execute("""INSERT OR IGNORE INTO episodes(
+                    anime_id,season,episode,status,filesystem_path,has_file
+                ) VALUES(?,?,?,?,?,1)""",
+                             (anime_id, season, number, "available", str(physical)))
             conn.commit()
         count += 1
     return count
@@ -478,7 +565,7 @@ def home() -> HTMLResponse:
 def library() -> HTMLResponse:
     with closing(db()) as conn:
         shows = conn.execute("SELECT a.*,count(e.id) episodes FROM anime a LEFT JOIN episodes e ON e.anime_id=a.id GROUP BY a.id ORDER BY a.title").fetchall()
-    body = Template("""<div class="panel"><h2>Tracked anime</h2><form method="post" action="/anime"><input name="title" placeholder="Anime title" required><input name="folder_name" placeholder="Custom folder name"><button>Add / Track</button></form></div>
+    body = Template("""<div class="panel"><div class="row"><h2 style="flex:1">Tracked anime</h2><form method="post" action="/library/sync"><button>Synchronize Jellyfin library</button></form></div><p class="muted">Jellyfin is the metadata source of truth; filesystem scanning verifies physical episode files.</p><form method="post" action="/anime"><input name="title" placeholder="Anime title" required><input name="folder_name" placeholder="Custom folder name"><button>Add / Track</button></form></div>
     <div class="panel"><table><tr><th>Anime</th><th>Folder</th><th>Episodes</th><th>Status</th></tr>{% for s in shows %}<tr><td>{{s.title}}</td><td>{{s.folder_name}}</td><td>{{s.episodes}}</td><td>{{s.status}}</td></tr>{% else %}<tr><td colspan="4">No anime tracked.</td></tr>{% endfor %}</table></div>""").render(shows=shows)
     return page(body)
 
@@ -491,6 +578,15 @@ def add_anime(title: str = Form(...), folder_name: str = Form("")) -> RedirectRe
                      (title, folder_name, title, now(), now()))
         conn.commit()
     return RedirectResponse("/library", status_code=303)
+
+
+@app.post("/library/sync")
+def library_sync() -> RedirectResponse:
+    try:
+        discovered = sync_jellyfin()
+    except (RuntimeError, ValueError, requests.RequestException) as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return RedirectResponse(f"/library?sync={discovered}", status_code=303)
 
 
 @app.post("/sync")

@@ -5,6 +5,7 @@ Anime Manager is a self-hosted FastAPI application for tracking anime in Jellyfi
 ## Implemented
 
 - Jellyfin library discovery and restart-safe synchronization.
+- The My Library page can manually synchronize Jellyfin, persist series/provider/alternate-title metadata, and reconcile Jellyfin episode records with physical media found under the mounted Shows path.
 - Automatic tracking of discovered series plus manual tracking with custom folder names.
 - Alternate/provider metadata storage, episode records, duplicate-safe release storage, and scan history in SQLite.
 - Independent Nyaa RSS and schema-discovered TsukiHime adapters.
@@ -37,6 +38,7 @@ Jellyfin may report `/ivan/Shows` or `/mnt/Jellyfin/JellyfinData/JP-BEAN/Shows`.
 - qBittorrent credentials are never rendered by the settings page.
 - Releases are only candidates until manually approved.
 - Completed files without English ASS/SSA are flagged for review and are not imported.
+- Jellyfin-reported host paths are translated through `JELLYFIN_PATH_PREFIXES`; both `/ivan/Shows` and the default `/mnt/Jellyfin/JellyfinData/JP-BEAN/Shows` mapping are supported.
 - TsukiHime is isolated behind its adapter and fails closed if its published OpenAPI schema has no compatible search/release endpoint.
 - Restrict the dashboard to a trusted network or place it behind an authenticated reverse proxy.
 
