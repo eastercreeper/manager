@@ -1,4 +1,5 @@
 from pathlib import Path
+import asyncio
 
 import pytest
 
@@ -259,8 +260,8 @@ def test_import_supports_season_and_multi_episode_without_overwrite(tmp_path, mo
                VALUES(?,?,?,?,?,?)""",
             (anime_id, "Nyaa", "release", "Anime", "https://example.test", main.now()),
         ).lastrowid
-        conn.execute("INSERT INTO downloads(release_id,state,save_path) VALUES(?,?,?)",
-                     (release_id, "completed", str(download_root)))
+        conn.execute("INSERT INTO downloads(release_id,state,save_path,content_path) VALUES(?,?,?,?)",
+                     (release_id, "completed", str(download_root), str(source)))
         conn.execute("INSERT INTO settings(key,value) VALUES(?,?)", ("library_dir", str(library_root)))
         conn.commit()
     monkeypatch.setattr(main, "inspect_media", lambda path: {
@@ -283,7 +284,8 @@ def test_import_rejects_non_ass_subtitles(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
     source_dir = tmp_path / "download"
     source_dir.mkdir()
-    (source_dir / "Anime - S01E01.mkv").write_bytes(b"video")
+    source = source_dir / "Anime - S01E01.mkv"
+    source.write_bytes(b"video")
     with main.db() as conn:
         anime_id = conn.execute(
             "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
@@ -293,8 +295,8 @@ def test_import_rejects_non_ass_subtitles(tmp_path, monkeypatch):
             "INSERT INTO releases(anime_id,source,source_id,title,page_url,created_at) VALUES(?,?,?,?,?,?)",
             (anime_id, "Nyaa", "release", "Anime", "https://example.test", main.now()),
         ).lastrowid
-        conn.execute("INSERT INTO downloads(release_id,state,save_path) VALUES(?,?,?)",
-                     (release_id, "completed", str(source_dir)))
+        conn.execute("INSERT INTO downloads(release_id,state,save_path,content_path) VALUES(?,?,?,?)",
+                     (release_id, "completed", str(source_dir), str(source_dir)))
         conn.commit()
     monkeypatch.setattr(main, "inspect_media", lambda path: {
         "audio": [], "subtitles": [{"codec_name": "subrip", "tags": {"language": "eng"}}],
@@ -304,3 +306,117 @@ def test_import_rejects_non_ass_subtitles(tmp_path, monkeypatch):
         row = conn.execute("SELECT state,error FROM downloads").fetchone()
     assert row["state"] == "needs_review"
     assert "ASS/SSA" in row["error"]
+
+
+def test_import_uses_each_torrent_content_path_for_two_anime(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "db.sqlite3"))
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    download_root = tmp_path / "downloads"
+    library_root = tmp_path / "library"
+    first = download_root / "torrent-one"
+    second = download_root / "torrent-two"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    first_file = first / "Alpha - S01E01.mkv"
+    second_file = second / "Beta - S01E02.mkv"
+    first_file.write_bytes(b"alpha")
+    second_file.write_bytes(b"beta")
+    with main.db() as conn:
+        anime_ids = []
+        release_ids = []
+        for title in ("Alpha", "Beta"):
+            anime_id = conn.execute(
+                "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
+                (title, title, title, main.now(), main.now()),
+            ).lastrowid
+            release_id = conn.execute(
+                "INSERT INTO releases(anime_id,source,source_id,title,page_url,created_at) VALUES(?,?,?,?,?,?)",
+                (anime_id, "Nyaa", title, title, "https://example.test", main.now()),
+            ).lastrowid
+            anime_ids.append(anime_id)
+            release_ids.append(release_id)
+        conn.execute("INSERT INTO settings(key,value) VALUES(?,?)", ("library_dir", str(library_root)))
+        conn.execute("INSERT INTO downloads(release_id,state,save_path,content_path) VALUES(?,?,?,?)",
+                     (release_ids[0], "completed", str(download_root), str(first)))
+        conn.execute("INSERT INTO downloads(release_id,state,save_path,content_path) VALUES(?,?,?,?)",
+                     (release_ids[1], "completed", str(download_root), str(second)))
+        conn.commit()
+    monkeypatch.setattr(main, "inspect_media", lambda path: {
+        "audio": [], "subtitles": [{"codec_name": "ass"}], "english_ass": True, "japanese_ass": False})
+    monkeypatch.setattr(main, "JellyfinClient", lambda: type("J", (), {"refresh": lambda self: None})())
+    assert main.import_completed() == 2
+    assert (library_root / "Alpha" / "Season 01" / "Alpha - S01E01.mkv").exists()
+    assert (library_root / "Beta" / "Season 01" / "Beta - S01E02.mkv").exists()
+    assert not (library_root / "Alpha" / "Season 01" / "Beta - S01E02.mkv").exists()
+
+
+def test_episode_parser_rejects_ambiguous_numbers_and_ignores_resolution():
+    assert main.parse_file_episodes(Path("Show - S01E03 [1080p][x265].mkv")) == (1, [3])
+    assert main.parse_file_episodes(Path("Show - EP04 [720p].mkv")) == (1, [4])
+    assert main.parse_file_episodes(Path("Show 2024 1080p x265.mkv")) == (1, [])
+
+
+def test_authentication_and_csrf_helpers(monkeypatch):
+    monkeypatch.setattr(main, "ADMIN_PASSWORD", "test-password")
+    cookie = main.session_cookie()
+    assert main.valid_session(cookie)
+    assert not main.valid_session("invalid")
+    from starlette.requests import Request
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": [],
+                       "query_string": b"", "scheme": "http", "client": ("test", 1),
+                       "server": ("test", 80), "root_path": ""})
+    request._cookies = {main.CSRF_COOKIE: "good"}
+    with pytest.raises(main.HTTPException):
+        main.require_csrf(request, "bad")
+
+
+def test_http_security_middleware_blocks_anonymous_and_csrfless_requests(monkeypatch):
+    monkeypatch.setattr(main, "ADMIN_PASSWORD", "test-password")
+
+    def request(method, path, cookie=""):
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+        return __import__("starlette.requests", fromlist=["Request"]).Request({
+            "type": "http", "method": method, "path": path, "headers": [
+                (b"cookie", cookie.encode())
+            ], "query_string": b"", "scheme": "http", "client": ("test", 1),
+            "server": ("test", 80), "root_path": "",
+        }, receive=receive)
+
+    async def next_response(request):
+        return main.HTMLResponse("ok")
+
+    anonymous = asyncio.run(main.security_middleware(request("GET", "/settings"), next_response))
+    assert anonymous.status_code == 303
+    session = main.session_cookie()
+    csrf = "csrf"
+    blocked = asyncio.run(main.security_middleware(
+        request("POST", "/settings", f"{main.SESSION_COOKIE}={session}; {main.CSRF_COOKIE}={csrf}"),
+        next_response,
+    ))
+    assert blocked.status_code == 403
+
+
+def test_release_search_persists_candidates_for_selected_anime(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "db.sqlite3"))
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    with main.db() as conn:
+        anime_id = conn.execute(
+            "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("Anime", "Anime", "Anime", main.now(), main.now()),
+        ).lastrowid
+        conn.commit()
+    release = {
+        "source": "Nyaa", "source_id": "release-1", "title": "Anime - 01",
+        "page_url": "https://nyaa.si/view/1", "torrent_url": "magnet:?xt=urn:btih:" + "e" * 40,
+        "info_hash": "e" * 40, "score": 10, "score_reason": "1080p",
+    }
+    monkeypatch.setattr(main, "parse_nyaa", lambda show: [release])
+    monkeypatch.setattr(main, "parse_tsukihime", lambda show: [])
+    results = main.persist_release_search(anime_id, "Anime")
+    assert results[0]["anime_id"] == anime_id
+    with main.db() as conn:
+        assert conn.execute("SELECT count(*) FROM releases").fetchone()[0] == 1
+    main.persist_release_search(anime_id, "Anime")
+    with main.db() as conn:
+        assert conn.execute("SELECT count(*) FROM releases").fetchone()[0] == 1

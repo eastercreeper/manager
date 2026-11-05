@@ -6,6 +6,10 @@ import sqlite3
 import subprocess
 import threading
 import urllib.parse
+import base64
+import hashlib
+import hmac
+import secrets
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +20,7 @@ import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
-from jinja2 import Template
+from jinja2 import Environment, select_autoescape
 
 DB_PATH = os.getenv("DB_PATH", "/data/anime-manager.sqlite3")
 DATA_DIR = Path(os.getenv("DATA_DIR", "/data"))
@@ -33,9 +37,69 @@ JELLYFIN_PATH_PREFIXES = [p for p in os.getenv(
     "JELLYFIN_PATH_PREFIXES",
     "/mnt/Jellyfin/JellyfinData/JP-BEAN/Shows=/ivan/Shows",
 ).split(",") if "=" in p]
+SESSION_SECRET = os.getenv("SESSION_SECRET", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+SESSION_COOKIE = "anime_manager_session"
+CSRF_COOKIE = "anime_manager_csrf"
 DB_LOCK = threading.Lock()
 scheduler = BackgroundScheduler(daemon=True)
 app = FastAPI(title="Anime Manager", version="1.0.0")
+templates = Environment(autoescape=select_autoescape(["html", "xml"]))
+_process_secret = secrets.token_bytes(32)
+
+
+def template(source: str):
+    return templates.from_string(source)
+
+
+def signing_secret() -> bytes:
+    return (SESSION_SECRET or ADMIN_PASSWORD).encode() or _process_secret
+
+
+def session_cookie() -> str:
+    value = str(int(datetime.now(timezone.utc).timestamp()))
+    signature = hmac.new(signing_secret(), value.encode(), hashlib.sha256).hexdigest()
+    return f"{value}.{signature}"
+
+
+def valid_session(value: str) -> bool:
+    try:
+        timestamp, signature = value.split(".", 1)
+        if abs(int(datetime.now(timezone.utc).timestamp()) - int(timestamp)) > 86400:
+            return False
+        expected = hmac.new(signing_secret(), timestamp.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(signature, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def csrf_token(request: Request) -> str:
+    return request.cookies.get(CSRF_COOKIE, "")
+
+
+def require_csrf(request: Optional[Request], token: str = "") -> None:
+    if request is not None and (not token or not hmac.compare_digest(token, csrf_token(request))):
+        raise HTTPException(403, "Invalid CSRF token")
+
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    if ADMIN_PASSWORD and request.url.path not in {"/login", "/health"}:
+        if not valid_session(request.cookies.get(SESSION_COOKIE, "")):
+            if request.method == "GET":
+                return RedirectResponse("/login", status_code=303)
+            return HTMLResponse("Authentication required", status_code=401)
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+            expected = request.cookies.get(CSRF_COOKIE, "")
+            body = await request.body()
+            encoded = urllib.parse.urlencode({"csrf_token": expected}).encode()
+            if not expected or encoded not in body:
+                return HTMLResponse("Invalid CSRF token", status_code=403)
+            request._body = body
+    response = await call_next(request)
+    if ADMIN_PASSWORD and not request.cookies.get(CSRF_COOKIE):
+        response.set_cookie(CSRF_COOKIE, secrets.token_urlsafe(32), httponly=False, samesite="strict", secure=False)
+    return response
 
 
 def now() -> str:
@@ -82,7 +146,8 @@ def db() -> sqlite3.Connection:
       id INTEGER PRIMARY KEY, release_id INTEGER UNIQUE NOT NULL REFERENCES releases(id),
       torrent_hash TEXT, name TEXT, progress REAL NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'queued',
       save_path TEXT, error TEXT, approved_at TEXT, completed_at TEXT, imported_at TEXT,
-      submission_key TEXT, reconcile_attempts INTEGER NOT NULL DEFAULT 0, last_checked TEXT
+      submission_key TEXT, reconcile_attempts INTEGER NOT NULL DEFAULT 0, last_checked TEXT,
+      content_path TEXT
     );
     CREATE TABLE IF NOT EXISTS media_verifications (
       id INTEGER PRIMARY KEY, download_id INTEGER NOT NULL REFERENCES downloads(id),
@@ -113,6 +178,7 @@ def db() -> sqlite3.Connection:
         ("submission_key", "TEXT"),
         ("reconcile_attempts", "INTEGER NOT NULL DEFAULT 0"),
         ("last_checked", "TEXT"),
+        ("content_path", "TEXT"),
     ):
         if name not in download_columns:
             conn.execute(f"ALTER TABLE downloads ADD COLUMN {name} {definition}")
@@ -258,6 +324,9 @@ class QBitClient:
         return sess
 
     def add(self, torrent_url: str, save_path: str = str(DOWNLOAD_DIR)) -> None:
+        scheme = urllib.parse.urlparse(torrent_url).scheme.lower()
+        if scheme not in {"magnet", "http", "https"}:
+            raise RuntimeError("Unsupported torrent URL")
         sess = self.session()
         response = sess.post(self.url + "/api/v2/torrents/add",
                              data={"urls": torrent_url, "savepath": save_path,
@@ -269,6 +338,12 @@ class QBitClient:
     def torrents(self) -> list[dict]:
         response = self.session().get(self.url + "/api/v2/torrents/info",
                                       params={"category": QBT_CATEGORY}, timeout=20)
+        response.raise_for_status()
+        return response.json()
+
+    def torrent_properties(self, torrent_hash: str) -> dict:
+        response = self.session().get(self.url + "/api/v2/torrents/properties",
+                                      params={"hash": torrent_hash}, timeout=20)
         response.raise_for_status()
         return response.json()
 
@@ -295,6 +370,23 @@ def inspect_media(path: Path) -> dict:
                    s.get("codec_name", "").lower() in acceptable) for s in subtitles)
     japanese = any((s.get("tags", {}).get("language", "").lower() in {"ja", "jpn", "japanese"} and
                     s.get("codec_name", "").lower() in acceptable) for s in subtitles)
+    external = []
+    for candidate in path.parent.glob(path.stem + ".*"):
+        if candidate.suffix.lower() not in {".ass", ".ssa", ".srt"}:
+            continue
+        language = candidate.stem.lower()
+        external.append({"path": str(candidate), "codec_name": candidate.suffix[1:].lower(),
+                         "tags": {"language": "jpn" if any(x in language for x in ("jpn", "ja", "japanese"))
+                                  else "eng" if any(x in language for x in ("eng", "en", "english")) else ""}})
+    subtitles.extend(external)
+    english = english or any(
+        s["tags"]["language"] in {"en", "eng", "english"} and s["codec_name"] in acceptable
+        for s in external
+    )
+    japanese = japanese or any(
+        s["tags"]["language"] in {"ja", "jpn", "japanese"} and s["codec_name"] in acceptable
+        for s in external
+    )
     return {"audio": audio, "subtitles": subtitles, "english_ass": english, "japanese_ass": japanese}
 
 
@@ -307,8 +399,23 @@ def parse_file_episodes(path: Path) -> tuple[int, list[int]]:
         start = int(range_match.group(1))
         end = int(range_match.group(2) or range_match.group(3) or start)
         return season, list(range(start, end + 1))
-    numbers = re.findall(r"(?<![a-z])(\d{1,3})(?![a-z])", stem, re.IGNORECASE)
-    return season, [int(numbers[-1])] if numbers else []
+    explicit = re.search(r"\b(?:ep?|episode)[ ._-]*(\d{1,3})(?:[-&](\d{1,3}))?\b", stem, re.IGNORECASE)
+    if explicit:
+        start = int(explicit.group(1))
+        end = int(explicit.group(2) or start)
+        return season, list(range(start, end + 1))
+    candidates = []
+    for match in re.finditer(r"(?<![A-Za-z])(\d{1,3})(?![A-Za-z])", stem):
+        value = int(match.group(1))
+        after = stem[match.end():].lower()
+        if value in {360, 480, 576, 720, 1080, 1440, 2160, 264, 265, 266} or value >= 1900:
+            continue
+        if re.match(r"\s*(?:p|bit|fps|x\d+)", after):
+            continue
+        candidates.append(value)
+    if len(candidates) == 1:
+        return season, candidates
+    return season, []
 
 
 def safe_filename(value: str) -> str:
@@ -317,6 +424,11 @@ def safe_filename(value: str) -> str:
     if not value or value in {".", ".."}:
         raise ValueError("Invalid media filename")
     return value[:240]
+
+
+def safe_external_url(value: str) -> str:
+    parsed = urllib.parse.urlparse(value or "")
+    return value if parsed.scheme in {"http", "https"} and parsed.netloc else "#"
 
 
 def library_destination(root: Path, folder_name: str, season: int, filename: str) -> Path:
@@ -387,6 +499,12 @@ def normalize_release(source: str, item: dict, fallback_url: str = "") -> Option
     identity = release_identity(item.get("id") or item.get("info_hash") or item.get("infoHash") or torrent_url or page_url, title)
     if not identity or not torrent_url:
         return None
+    torrent_scheme = urllib.parse.urlparse(str(torrent_url)).scheme.lower()
+    if torrent_scheme not in {"magnet", "http", "https"}:
+        return None
+    page_scheme = urllib.parse.urlparse(str(page_url)).scheme.lower()
+    if page_scheme not in {"http", "https"}:
+        page_url = fallback_url or torrent_url
     release = {
         "source": source, "source_id": identity, "title": title, "page_url": page_url or torrent_url,
         "torrent_url": torrent_url, "info_hash": release_identity(item.get("info_hash") or item.get("infoHash") or torrent_url),
@@ -455,6 +573,26 @@ def parse_tsukihime(show: sqlite3.Row) -> list[dict]:
         return [release for item in items if (release := normalize_release("TsukiHime", item, TSUKIHIME_BASE))]
     except (requests.RequestException, ValueError, StopIteration, KeyError, TypeError):
         return []
+
+
+def persist_release_search(anime_id: int, query: str) -> list[dict]:
+    releases = parse_nyaa({"search_query": query}) + parse_tsukihime({"search_query": query})
+    with DB_LOCK, closing(db()) as conn:
+        for release in releases:
+            conn.execute("""INSERT OR IGNORE INTO releases(
+                anime_id,source,source_id,title,page_url,torrent_url,info_hash,published,group_name,quality,
+                episode,audio_hint,subtitle_hint,codec,size_bytes,seeders,leechers,score,score_reason,created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                         (anime_id, release["source"], release["source_id"], release["title"], release["page_url"],
+                          release["torrent_url"], release.get("info_hash"), release.get("published"),
+                          release.get("group_name"), release.get("quality"), release.get("episode"),
+                          release.get("audio_hint"), release.get("subtitle_hint"), release.get("codec"),
+                          release.get("size_bytes"), release.get("seeders"), release.get("leechers"),
+                          release["score"], release["score_reason"], now()))
+        conn.commit()
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM releases WHERE anime_id=? AND status='pending' ORDER BY score DESC,id DESC LIMIT 100",
+            (anime_id,)).fetchall()]
 
 
 def scan_sources() -> int:
@@ -576,10 +714,26 @@ def search_anime(query: str) -> list[dict]:
 def import_completed() -> int:
     imported = 0
     with DB_LOCK, closing(db()) as conn:
-        for download in conn.execute("SELECT d.*,r.anime_id,a.folder_name,a.title FROM downloads d JOIN releases r ON r.id=d.release_id JOIN anime a ON a.id=r.anime_id WHERE d.state='completed' AND d.imported_at IS NULL").fetchall():
-            root = Path(download["save_path"] or setting(conn, "download_dir", str(DOWNLOAD_DIR)))
-            library_root = Path(setting(conn, "library_dir", str(LIBRARY_DIR)))
-            files = [p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES]
+        for download in conn.execute("""SELECT d.*,r.anime_id,a.folder_name,a.title FROM downloads d
+            JOIN releases r ON r.id=d.release_id JOIN anime a ON a.id=r.anime_id
+            WHERE d.state='completed' AND d.imported_at IS NULL""").fetchall():
+            content = Path(download["content_path"]) if download["content_path"] else None
+            download_root = Path(download["save_path"] or setting(conn, "download_dir", str(DOWNLOAD_DIR))).resolve()
+            if content:
+                try:
+                    content = content.resolve()
+                    if download_root != content and download_root not in content.parents:
+                        content = None
+                except OSError:
+                    content = None
+            if not content or not content.exists():
+                conn.execute("UPDATE downloads SET state='needs_review',error=? WHERE id=?",
+                             ("Torrent content path is unavailable; refusing to scan the shared download directory", download["id"]))
+                continue
+            files = [content] if content.is_file() else [
+                p for p in content.rglob("*") if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES
+            ]
+            library_root = Path(setting(conn, "library_dir", str(LIBRARY_DIR))).resolve()
             imported_files_for_download = 0
             verification_failed = False
             for source in files:
@@ -689,16 +843,26 @@ def monitor_downloads() -> None:
                     state=CASE WHEN state IN ('queued','submitted') THEN 'awaiting_qbittorrent' ELSE state END
                     WHERE id=?""", (now(), row["id"]))
                 continue
+            content_path = torrent.get("content_path")
+            if not content_path and torrent.get("hash") and hasattr(client, "torrent_properties"):
+                try:
+                    properties = client.torrent_properties(str(torrent["hash"]))
+                    save_path = properties.get("save_path") or torrent.get("save_path")
+                    if save_path and torrent.get("name"):
+                        candidate = Path(save_path) / str(torrent["name"])
+                        content_path = str(candidate) if candidate.exists() else None
+                except (requests.RequestException, RuntimeError):
+                    content_path = None
             state = "completed" if float(torrent.get("progress", 0)) >= 1 else str(torrent.get("state", "downloading"))
-            conn.execute("""UPDATE downloads SET torrent_hash=?,progress=?,state=?,name=?,save_path=?,last_checked=?,
+            conn.execute("""UPDATE downloads SET torrent_hash=?,progress=?,state=?,name=?,save_path=?,content_path=?,last_checked=?,
                 completed_at=CASE WHEN ?='completed' THEN COALESCE(completed_at,?) ELSE completed_at END WHERE id=?""",
                          (str(torrent.get("hash", "")) or row["torrent_hash"], float(torrent.get("progress", 0)),
-                          state, torrent.get("name"), torrent.get("save_path"), now(), state, now(), row["id"]))
+                          state, torrent.get("name"), torrent.get("save_path"), content_path, now(), state, now(), row["id"]))
         conn.commit()
     import_completed()
 
 
-PAGE = Template(r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+PAGE = template(r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Anime Manager</title><style>
 body{font:15px system-ui;background:#10121a;color:#e8eaf0;margin:0 auto;padding:24px;max-width:1250px}h1,h2{margin:.3em 0 .7em}
 .muted{color:#a4a9b8}.panel{background:#1b1f2a;border:1px solid #303646;border-radius:12px;padding:16px;margin:14px 0}
@@ -711,7 +875,31 @@ nav a{margin-right:15px} .stat{font-size:24px;font-weight:700}
 
 
 def page(body: str, message: str = "") -> HTMLResponse:
-    return HTMLResponse(PAGE.render(body=body, message=message))
+    token = secrets.token_urlsafe(32)
+    body = body.replace("<form", f'<form><input type="hidden" name="csrf_token" value="{token}">')
+    response = HTMLResponse(PAGE.render(body=body, message=message))
+    if ADMIN_PASSWORD:
+        response.set_cookie(CSRF_COOKIE, token, httponly=False, samesite="strict", secure=False)
+    return response
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(error: str = "") -> HTMLResponse:
+    if not ADMIN_PASSWORD:
+        return page('<div class="panel"><h2>Authentication is not configured</h2><p>Set ADMIN_PASSWORD before exposing the dashboard.</p></div>')
+    body = template("""<div class="panel"><h2>Sign in</h2>{% if error %}<p>{{error}}</p>{% endif %}
+        <form method="post"><input name="password" type="password" required autofocus><button>Sign in</button></form></div>""").render(error=error)
+    return page(body)
+
+
+@app.post("/login")
+def login(password: str = Form(...)) -> RedirectResponse:
+    if not ADMIN_PASSWORD or not hmac.compare_digest(password, ADMIN_PASSWORD):
+        return RedirectResponse("/login?error=Invalid%20credentials", status_code=303)
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(SESSION_COOKIE, session_cookie(), httponly=True, samesite="strict", secure=False, max_age=86400)
+    response.set_cookie(CSRF_COOKIE, secrets.token_urlsafe(32), httponly=False, samesite="strict", secure=False)
+    return response
 
 
 @app.on_event("startup")
@@ -736,9 +924,11 @@ def home() -> HTMLResponse:
             "anime": "SELECT count(*) FROM anime", "airing": "SELECT count(*) FROM anime WHERE status='airing'",
             "pending": "SELECT count(*) FROM releases WHERE status='pending'",
             "attention": "SELECT count(*) FROM downloads WHERE state='needs_review'"}.items()}
-        releases = conn.execute("""SELECT r.*,a.title anime_title FROM releases r JOIN anime a ON a.id=r.anime_id
-            WHERE r.status='pending' ORDER BY r.score DESC,r.id DESC LIMIT 50""").fetchall()
-    body = Template("""<div class="row">{% for k,v in stats.items() %}<div class="panel"><div class="muted">{{k}}</div><div class="stat">{{v}}</div></div>{% endfor %}</div>
+        releases = [dict(row) for row in conn.execute("""SELECT r.*,a.title anime_title FROM releases r JOIN anime a ON a.id=r.anime_id
+            WHERE r.status='pending' ORDER BY r.score DESC,r.id DESC LIMIT 50""").fetchall()]
+        for release in releases:
+            release["page_url"] = safe_external_url(release["page_url"])
+    body = template("""<div class="row">{% for k,v in stats.items() %}<div class="panel"><div class="muted">{{k}}</div><div class="stat">{{v}}</div></div>{% endfor %}</div>
     <div class="panel"><div class="row"><h2 style="flex:1">Awaiting approval</h2><form method="post" action="/sync"><button>Sync now</button></form></div>
     <table><tr><th>Release</th><th>Anime</th><th>Score</th><th>Action</th></tr>{% for r in releases %}<tr><td><a href="{{r.page_url}}" target="_blank" rel="noreferrer">{{r.title}}</a><br><span class="muted">{{r.source}} · {{r.score_reason}}</span></td><td>{{r.anime_title}}</td><td>{{"%.1f"|format(r.score)}}</td><td><form class="inline" method="post" action="/releases/{{r.id}}/approve"><button>Approve</button></form><form class="inline" method="post" action="/releases/{{r.id}}/reject"><button class="danger">Reject</button></form></td></tr>{% else %}<tr><td colspan="4" class="muted">Nothing awaiting approval.</td></tr>{% endfor %}</table></div>""").render(stats=stats, releases=releases)
     return page(body)
@@ -748,7 +938,7 @@ def home() -> HTMLResponse:
 def library() -> HTMLResponse:
     with closing(db()) as conn:
         shows = conn.execute("SELECT a.*,count(e.id) episodes FROM anime a LEFT JOIN episodes e ON e.anime_id=a.id GROUP BY a.id ORDER BY a.title").fetchall()
-    body = Template("""<div class="panel"><div class="row"><h2 style="flex:1">Tracked anime</h2><form method="post" action="/library/sync"><button>Synchronize Jellyfin library</button></form></div><p class="muted">Jellyfin is the metadata source of truth; filesystem scanning verifies physical episode files.</p><form method="post" action="/anime"><input name="title" placeholder="Anime title" required><input name="folder_name" placeholder="Custom folder name"><button>Add / Track</button></form></div>
+    body = template("""<div class="panel"><div class="row"><h2 style="flex:1">Tracked anime</h2><form method="post" action="/library/sync"><button>Synchronize Jellyfin library</button></form></div><p class="muted">Jellyfin is the metadata source of truth; filesystem scanning verifies physical episode files.</p><form method="post" action="/anime"><input name="title" placeholder="Anime title" required><input name="folder_name" placeholder="Custom folder name"><button>Add / Track</button></form></div>
     <div class="panel"><table><tr><th>Anime</th><th>Folder</th><th>Episodes</th><th>Status</th></tr>{% for s in shows %}<tr><td>{{s.title}}</td><td>{{s.folder_name}}</td><td>{{s.episodes}}</td><td>{{s.status}}</td></tr>{% else %}<tr><td colspan="4">No anime tracked.</td></tr>{% endfor %}</table></div>""").render(shows=shows)
     return page(body)
 
@@ -773,19 +963,39 @@ def library_sync() -> RedirectResponse:
 
 
 @app.get("/search", response_class=HTMLResponse)
-def search_page(q: str = "", release_q: str = "") -> HTMLResponse:
+def search_page(q: str = "", release_q: str = "", anime_id: int = 0) -> HTMLResponse:
     anime_results = search_anime(q) if q else []
     releases = []
-    if release_q:
-        synthetic = {"search_query": release_q}
-        releases = parse_nyaa(synthetic) + parse_tsukihime(synthetic)
-        releases.sort(key=lambda item: item.get("score", 0), reverse=True)
-    body = Template("""<div class="panel"><h2>Search anime</h2>
+    with closing(db()) as conn:
+        tracked = conn.execute("SELECT id,title FROM anime ORDER BY title").fetchall()
+    if release_q and anime_id:
+        try:
+            releases = persist_release_search(anime_id, release_q)
+        except (requests.RequestException, ValueError):
+            releases = []
+    body = template("""<div class="panel"><h2>Search anime</h2>
     <form method="get"><input name="q" value="{{q}}" placeholder="Japanese, English, or alternate title" size="45"><button>Search metadata</button></form>
     <table><tr><th>Title</th><th>Year</th><th>Provider IDs</th><th>Action</th></tr>{% for item in anime_results %}<tr><td>{{item.title}}{% if item.folder_name and item.folder_name != item.title %}<br><span class="muted">{{item.folder_name}}</span>{% endif %}</td><td>{{item.year or ''}}</td><td>{{item.provider_ids or ''}}</td><td><form method="post" action="/anime"><input type="hidden" name="title" value="{{item.title}}"><input name="folder_name" placeholder="Custom folder name"><button>Track anime</button></form></td></tr>{% else %}<tr><td colspan="4">No metadata matches.</td></tr>{% endfor %}</table></div>
-    <div class="panel"><h2>Search releases</h2><form method="get"><input name="release_q" value="{{release_q}}" placeholder="Title or identifier" size="45"><button>Search Nyaa and TsukiHime</button></form>
-    <table><tr><th>Release</th><th>Source</th><th>Quality</th><th>Audio/subtitles</th><th>Seeders</th><th>Score</th></tr>{% for r in releases %}<tr><td><a href="{{r.page_url}}" target="_blank" rel="noreferrer">{{r.title}}</a></td><td>{{r.source}}</td><td>{{r.quality}}</td><td>{{r.audio_hint}} / {{r.subtitle_hint}}</td><td>{{r.seeders}}</td><td>{{"%.1f"|format(r.score)}}<br><span class="muted">{{r.score_reason}}</span></td></tr>{% else %}<tr><td colspan="6">No release matches.</td></tr>{% endfor %}</table></div>""").render(
-        q=q, release_q=release_q, anime_results=anime_results, releases=releases)
+    <div class="panel"><h2>Search releases</h2><form method="get"><input name="release_q" value="{{release_q}}" placeholder="Title or identifier" size="45"><select name="anime_id" required><option value="">Track releases for...</option>{% for anime in tracked %}<option value="{{anime.id}}" {% if anime.id == anime_id %}selected{% endif %}>{{anime.title}}</option>{% endfor %}</select><button>Search Nyaa and TsukiHime</button></form>
+    <table><tr><th>Release</th><th>Source</th><th>Quality</th><th>Audio/subtitles</th><th>Seeders</th><th>Score</th><th>Action</th></tr>{% for r in releases %}<tr><td><a href="/releases/{{r.id}}">{{r.title}}</a></td><td>{{r.source}}</td><td>{{r.quality}}</td><td>{{r.audio_hint}} / {{r.subtitle_hint}}</td><td>{{r.seeders}}</td><td>{{"%.1f"|format(r.score)}}<br><span class="muted">{{r.score_reason}}</span></td><td><form class="inline" method="post" action="/releases/{{r.id}}/approve"><button>Approve</button></form><form class="inline" method="post" action="/releases/{{r.id}}/reject"><button class="danger">Reject</button></form></td></tr>{% else %}<tr><td colspan="7">No release matches.</td></tr>{% endfor %}</table></div>""").render(
+        q=q, release_q=release_q, anime_id=anime_id, tracked=tracked, anime_results=anime_results, releases=releases)
+    return page(body)
+
+
+@app.get("/releases/{release_id}", response_class=HTMLResponse)
+def release_detail(release_id: int) -> HTMLResponse:
+    with closing(db()) as conn:
+        release = conn.execute("""SELECT r.*,a.title anime_title FROM releases r JOIN anime a ON a.id=r.anime_id
+            WHERE r.id=?""", (release_id,)).fetchone()
+    if not release:
+        raise HTTPException(404, "Release not found")
+    release = dict(release)
+    release["page_url"] = safe_external_url(release["page_url"])
+    body = template("""<div class="panel"><h2>{{release.title}}</h2><p>{{release.anime_title}} · {{release.source}}</p>
+        <p>Quality: {{release.quality}} · Audio: {{release.audio_hint}} · Subtitles: {{release.subtitle_hint}}</p>
+        <p>Seeders: {{release.seeders}} · Leechers: {{release.leechers}} · Score: {{release.score}}</p>
+        <p>{{release.score_reason}}</p><form class="inline" method="post" action="/releases/{{release.id}}/approve"><button>Approve</button></form>
+        <form class="inline" method="post" action="/releases/{{release.id}}/reject"><button class="danger">Reject</button></form></div>""").render(release=release)
     return page(body)
 
 
@@ -800,7 +1010,7 @@ def episodes() -> HTMLResponse:
     with closing(db()) as conn:
         rows = conn.execute("""SELECT e.*,a.title AS anime_title FROM episodes e JOIN anime a ON a.id=e.anime_id
             ORDER BY e.air_date DESC LIMIT 100""").fetchall()
-    body = Template("""<div class="panel"><h2>Episodes</h2><table><tr><th>Anime</th><th>Episode</th><th>Title</th><th>Status</th></tr>{% for e in rows %}<tr><td>{{e.anime_title}}</td><td>S{{"%02d"|format(e.season or 1)}}E{{"%02d"|format(e.episode)}}</td><td>{{e.title}}</td><td>{{e.status}}</td></tr>{% else %}<tr><td colspan="4">No episode metadata yet. Run Sync now.</td></tr>{% endfor %}</table></div>""").render(rows=rows)
+    body = template("""<div class="panel"><h2>Episodes</h2><table><tr><th>Anime</th><th>Episode</th><th>Title</th><th>Status</th></tr>{% for e in rows %}<tr><td>{{e.anime_title}}</td><td>S{{"%02d"|format(e.season or 1)}}E{{"%02d"|format(e.episode)}}</td><td>{{e.title}}</td><td>{{e.status}}</td></tr>{% else %}<tr><td colspan="4">No episode metadata yet. Run Sync now.</td></tr>{% endfor %}</table></div>""").render(rows=rows)
     return page(body)
 
 
@@ -808,7 +1018,7 @@ def episodes() -> HTMLResponse:
 def downloads() -> HTMLResponse:
     with closing(db()) as conn:
         rows = conn.execute("""SELECT d.*,r.title FROM downloads d JOIN releases r ON r.id=d.release_id ORDER BY d.id DESC""").fetchall()
-    body = Template("""<div class="panel"><h2>Downloads</h2><table><tr><th>Release</th><th>State</th><th>Progress</th><th>Verification</th></tr>{% for d in rows %}<tr><td>{{d.title}}</td><td>{{d.state}}</td><td>{{"%.1f"|format(d.progress*100)}}%</td><td>{{d.error or "pending"}}</td></tr>{% else %}<tr><td colspan="4">No approved downloads.</td></tr>{% endfor %}</table></div>""").render(rows=rows)
+    body = template("""<div class="panel"><h2>Downloads</h2><table><tr><th>Release</th><th>State</th><th>Progress</th><th>Verification</th></tr>{% for d in rows %}<tr><td>{{d.title}}</td><td>{{d.state}}</td><td>{{"%.1f"|format(d.progress*100)}}%</td><td>{{d.error or "pending"}}</td></tr>{% else %}<tr><td colspan="4">No approved downloads.</td></tr>{% endfor %}</table></div>""").render(rows=rows)
     return page(body)
 
 
@@ -816,7 +1026,7 @@ def downloads() -> HTMLResponse:
 def history() -> HTMLResponse:
     with closing(db()) as conn:
         rows = conn.execute("SELECT * FROM scan_history ORDER BY id DESC LIMIT 50").fetchall()
-    body = Template("""<div class="panel"><h2>History</h2><table><tr><th>Kind</th><th>Status</th><th>Message</th><th>Finished</th></tr>{% for r in rows %}<tr><td>{{r.kind}}</td><td>{{r.status}}</td><td>{{r.message}}</td><td>{{r.finished_at}}</td></tr>{% endfor %}</table></div>""").render(rows=rows)
+    body = template("""<div class="panel"><h2>History</h2><table><tr><th>Kind</th><th>Status</th><th>Message</th><th>Finished</th></tr>{% for r in rows %}<tr><td>{{r.kind}}</td><td>{{r.status}}</td><td>{{r.message}}</td><td>{{r.finished_at}}</td></tr>{% endfor %}</table></div>""").render(rows=rows)
     return page(body)
 
 
@@ -824,7 +1034,7 @@ def history() -> HTMLResponse:
 def settings() -> HTMLResponse:
     with closing(db()) as conn:
         values = {row["key"]: row["value"] for row in conn.execute("SELECT key,value FROM settings")}
-    body = Template("""<div class="panel"><h2>Settings</h2><form method="post"><p>Jellyfin URL <input name="jellyfin_url" value="{{values.get('jellyfin_url','')}}" size="45"></p><p>Jellyfin API key <input name="jellyfin_api_key" type="password" placeholder="unchanged if blank" size="45"></p><p>qBittorrent URL <input name="qbittorrent_url" value="{{values.get('qbittorrent_url','')}}" size="45"></p><p>qBittorrent username <input name="qbittorrent_username" value="{{values.get('qbittorrent_username','')}}" size="25"></p><p>qBittorrent password <input name="qbittorrent_password" type="password" placeholder="unchanged if blank" size="25"></p><p>Library path <input name="library_dir" value="{{values.get('library_dir','/ivan/Shows')}}" size="35"></p><p>Download path <input name="download_dir" value="{{values.get('download_dir','/downloads')}}" size="35"></p><button>Save settings</button></form><p class="muted">Secrets are never returned in frontend responses. Environment variables take precedence.</p></div>""").render(values=values)
+    body = template("""<div class="panel"><h2>Settings</h2><form method="post"><p>Jellyfin URL <input name="jellyfin_url" value="{{values.get('jellyfin_url','')}}" size="45"></p><p>Jellyfin API key <input name="jellyfin_api_key" type="password" placeholder="unchanged if blank" size="45"></p><p>qBittorrent URL <input name="qbittorrent_url" value="{{values.get('qbittorrent_url','')}}" size="45"></p><p>qBittorrent username <input name="qbittorrent_username" value="{{values.get('qbittorrent_username','')}}" size="25"></p><p>qBittorrent password <input name="qbittorrent_password" type="password" placeholder="unchanged if blank" size="25"></p><p>Library path <input name="library_dir" value="{{values.get('library_dir','/ivan/Shows')}}" size="35"></p><p>Download path <input name="download_dir" value="{{values.get('download_dir','/downloads')}}" size="35"></p><button>Save settings</button></form><p class="muted">Secrets are never returned in frontend responses. Environment variables take precedence.</p></div>""").render(values=values)
     return page(body)
 
 
@@ -868,10 +1078,11 @@ def approve(release_id: int) -> RedirectResponse:
         except (RuntimeError, requests.RequestException) as exc:
             raise HTTPException(502, str(exc)) from exc
         conn.execute("UPDATE releases SET status='approved' WHERE id=?", (release_id,))
-        conn.execute("""INSERT INTO downloads(release_id,torrent_hash,state,save_path,approved_at,submission_key,last_checked)
-            VALUES(?,?,?,?,?,?,?)""",
+        conn.execute("""INSERT INTO downloads(release_id,torrent_hash,state,save_path,content_path,approved_at,submission_key,last_checked)
+            VALUES(?,?,?,?,?,?,?,?)""",
                      (release_id, (existing or {}).get("hash") or info_hash, "submitted" if not existing else
-                      str(existing.get("state", "queued")), str(save_path), now(), info_hash, now()))
+                      str(existing.get("state", "queued")), str(save_path), (existing or {}).get("content_path"),
+                      now(), info_hash, now()))
         conn.commit()
     return RedirectResponse("/", status_code=303)
 

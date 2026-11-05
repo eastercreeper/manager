@@ -16,6 +16,7 @@ Anime Manager is a self-hosted FastAPI application for tracking anime in Jellyfi
 - ffprobe verification of actual streams. English ASS/SSA is mandatory; SRT is never accepted as a substitute.
 - Safe path mapping, path traversal protection, duplicate-safe imports, Jellyfin refresh, interrupted-import recovery, and a manual-review state for failed verification.
 - Search page for Jellyfin/tracked metadata plus Nyaa/TsukiHime release comparison and explicit approval/rejection.
+- Optional password authentication with signed 24-hour sessions and double-submit CSRF protection for state-changing browser forms. Set `ADMIN_PASSWORD` and `SESSION_SECRET` in the Compose environment.
 - Season-aware single- and multi-episode importing that preserves the source container and leaves source files untouched.
 - Dashboard, library, search, episodes, downloads, history, and settings pages.
 
@@ -39,6 +40,7 @@ Jellyfin may report `/ivan/Shows` or `/mnt/Jellyfin/JellyfinData/JP-BEAN/Shows`.
 
 - The first synchronization can be started from the Dashboard's **Sync now** button.
 - qBittorrent credentials are never rendered by the settings page.
+- `ADMIN_PASSWORD` is intentionally required to enable browser authentication; without it the app remains suitable only for a trusted private network.
 - Releases are only candidates until manually approved.
 - Completed files without English ASS/SSA are flagged for review and are not imported.
 - The Search page uses Jellyfin/tracked metadata; it is not a general-purpose external metadata catalog.
