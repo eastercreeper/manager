@@ -11,7 +11,13 @@ services:
     environment:
       - TZ=America/Los_Angeles
       - DB_PATH=/data/anime-manager.sqlite3
+      - DATA_DIR=/data
+      - LIBRARY_DIR=/ivan/Shows
+      - DOWNLOAD_DIR=/downloads
       - NYAA_BASE=https://nyaa.si/
+      - TSUKIHIME_BASE=https://api.tsukihime.org/v1
+      - JELLYFIN_URL=${JELLYFIN_URL:-}
+      - JELLYFIN_API_KEY=${JELLYFIN_API_KEY:-}
       - QBITTORRENT_URL=http://127.0.0.1:30024
       - QBITTORRENT_USERNAME=${QBITTORRENT_USERNAME}
       - QBITTORRENT_PASSWORD=${QBITTORRENT_PASSWORD}
@@ -21,3 +27,5 @@ services:
       - SCAN_INTERVAL_MINUTES=30
     volumes:
       - /mnt/.ix-apps/app_mounts/anime-manager/data:/data
+      - /mnt/Jellyfin/JellyfinData/JP-BEAN/Shows:/ivan/Shows
+      - /mnt/.ix-apps/app_mounts/qbittorrent/downloads:/downloads

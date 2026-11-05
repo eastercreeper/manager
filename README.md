@@ -1,47 +1,51 @@
-# Anime Manager — MVP scaffold
+# Anime Manager
 
-This is a deliberately conservative first milestone:
-- Manually add anime titles.
-- Scan Nyaa's RSS feed every 30 minutes (configurable) for 1080p English-translated anime-category releases.
-- Place matches in an approval queue.
-- Only an explicit Approve click calls qBittorrent's Web API.
-- Store tracked titles and release history in SQLite.
+Anime Manager is a self-hosted FastAPI application for tracking anime in Jellyfin, finding releases from Nyaa.si and TsukiHime, manually approving torrents in qBittorrent, and importing only media that contains English ASS/SSA subtitles.
 
-## Important limitations
-- TsukiHime is not yet wired in. Its wiki links to API docs at https://api.tsukihime.org/v1/docs, but the schema needs to be inspected before implementing requests; no endpoints are guessed.
-- This MVP does not rename, hardlink, copy, or import completed files into Jellyfin. It only adds approved torrents to qBittorrent.
-- Nyaa RSS field formats can vary. Test with a single tracked title and inspect the approval queue before relying on it.
-- Add authentication/reverse-proxy protection before exposing the dashboard beyond a trusted network.
-- Do not expose qBittorrent credentials in chat or commit them to source control.
+## Implemented
 
-## Build
-Extract this directory to:
-`/mnt/.ix-apps/app_mounts/anime-manager`
+- Jellyfin library discovery and restart-safe synchronization.
+- Automatic tracking of discovered series plus manual tracking with custom folder names.
+- Alternate/provider metadata storage, episode records, duplicate-safe release storage, and scan history in SQLite.
+- Independent Nyaa RSS and schema-discovered TsukiHime adapters.
+- Release score and explanation based on multi-audio/Japanese audio, English/Japanese subtitle hints, 1080p, and seeders.
+- Explicit approval before qBittorrent submission; no automatic torrent downloads.
+- qBittorrent progress monitoring and download history.
+- ffprobe verification of actual streams. English ASS/SSA is mandatory; SRT is never accepted as a substitute.
+- Safe path mapping, path traversal protection, duplicate-safe imports, Jellyfin refresh, and a manual-review state for failed verification.
+- Dashboard, library, episodes, downloads, history, and settings pages.
 
-From a shell on TrueNAS:
-`cd /mnt/.ix-apps/app_mounts/anime-manager`
-`docker build -t anime-manager:0.1 .`
+## TrueNAS SCALE deployment
 
-Merge `compose-service.yml` into the existing Compose project. Add `8787:8787/tcp` to the existing `tailscale.ports` list. Keep the existing qBittorrent, Qui, and Tailscale definitions unchanged otherwise.
+1. Copy this repository to `/mnt/.ix-apps/app_mounts/anime-manager`.
+2. Merge `compose-service.yml` into the existing Compose project. The Anime Manager service intentionally uses `network_mode: service:tailscale`; add `8787:8787/tcp` to the existing `tailscale.ports` list and do not add a ports mapping to this service.
+3. Adjust the two host-side volume paths if your existing mounts differ:
+   - Jellyfin Shows -> `/ivan/Shows`
+   - qBittorrent downloads -> `/downloads`
+4. Set `JELLYFIN_URL`, `JELLYFIN_API_KEY`, `QBITTORRENT_USERNAME`, and `QBITTORRENT_PASSWORD` in the Compose environment/secrets configuration. An `.env` file is not required.
+5. Start the stack and open `http://<TRUENAS-LAN-IP>:8787`.
 
-Because anime-manager uses `network_mode: service:tailscale`, it shares the same network namespace as qBittorrent and Qui. It can reach qBittorrent at `http://127.0.0.1:30024`, and its outbound requests follow the same Tailscale exit-node routing.
+The container creates `/data`, `/downloads`, and `/ivan/Shows` as needed. Persistent application state is stored in `/data`. The image includes `ffprobe`, runs as an unprivileged user, listens on `0.0.0.0:8787`, and uses `tini` for graceful shutdown.
 
-Set `QBITTORRENT_USERNAME` and `QBITTORRENT_PASSWORD` as environment variables in the Compose app's environment/secrets configuration. Do not paste them into chat.
+## Path mapping
 
-Dashboard: `http://<TRUENAS-LAN-IP>:8787`
+Jellyfin may report `/ivan/Shows` or `/mnt/Jellyfin/JellyfinData/JP-BEAN/Shows`. The default mapping resolves the latter to the mounted `/ivan/Shows` path. Override `JELLYFIN_PATH_PREFIXES` with comma-separated `source=container` mappings when required.
 
-## First test
-1. Confirm qBittorrent WebUI works at port 30024.
-2. Create the qBittorrent category `anime`.
-3. Ensure qBittorrent's `/downloads` path exists and that `/downloads/anime` is the intended save location.
-4. Start the stack and open `/health`.
-5. Add one anime title. The first scan runs on the configured schedule; use Scan sources now for an immediate scan.
-6. Inspect results; only click Approve & add after checking the release page, uploader, and file details.
+## Operational notes
 
-## Next development milestones
-1. Verify Nyaa RSS metadata and improve magnet/torrent extraction.
-2. Read the TsukiHime API OpenAPI schema and implement its provider.
-3. Add season/cour/absolute-episode metadata and release-group preferences.
-4. Add scheduled scans, per-show filters, and source deduplication.
-5. Add safe post-download library import using hardlinks or copies, with seeding preserved.
-6. Add dashboard authentication and audit logging.
+- The first synchronization can be started from the Dashboard's **Sync now** button.
+- qBittorrent credentials are never rendered by the settings page.
+- Releases are only candidates until manually approved.
+- Completed files without English ASS/SSA are flagged for review and are not imported.
+- TsukiHime is isolated behind its adapter and fails closed if its published OpenAPI schema has no compatible search/release endpoint.
+- Restrict the dashboard to a trusted network or place it behind an authenticated reverse proxy.
+
+## Development
+
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+pytest -q
+uvicorn app.main:app --host 0.0.0.0 --port 8787
+```

@@ -1,0 +1,1 @@
+"""Anime Manager application package."""
