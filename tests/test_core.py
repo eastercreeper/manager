@@ -1,5 +1,3 @@
-import sqlite3
-import json
 from pathlib import Path
 
 import pytest
@@ -133,3 +131,176 @@ def test_jellyfin_sync_updates_existing_manual_anime_without_duplicate(tmp_path,
     with main.db() as conn:
         assert conn.execute("SELECT count(*) FROM anime").fetchone()[0] == 1
         assert conn.execute("SELECT jellyfin_id FROM anime").fetchone()[0] == "series-1"
+
+
+def test_tsukihime_normalizes_schema_and_score(monkeypatch):
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "paths": {"/releases/search": {
+                    "get": {"parameters": [{"name": "q"}]}
+                }}
+            }
+
+    class Results:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"results": [{
+                "title": "[Group] Anime 01",
+                "magnet": "magnet:?xt=urn:btih:" + "b" * 40,
+                "info_hash": "b" * 40, "resolution": "1080p",
+                "audio": "dual audio", "subtitles": "English ASS",
+                "seeders": 42, "leechers": 3,
+            }]}
+
+    monkeypatch.setattr(main.requests, "get", lambda *args, **kwargs: Response())
+    monkeypatch.setattr(main.requests, "request", lambda *args, **kwargs: Results())
+    results = main.parse_tsukihime({"search_query": "Anime"})
+    assert len(results) == 1
+    assert results[0]["source"] == "TsukiHime"
+    assert results[0]["source_id"] == "b" * 40
+    assert results[0]["torrent_url"].startswith("magnet:")
+    assert results[0]["score"] > 0
+    assert "1080p" in results[0]["score_reason"]
+
+
+def test_monitor_reconciles_delayed_torrent_visibility(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "db.sqlite3"))
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    with main.db() as conn:
+        anime_id = conn.execute(
+            "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("Anime", "Anime", "Anime", main.now(), main.now()),
+        ).lastrowid
+        release_id = conn.execute(
+            """INSERT INTO releases(anime_id,source,source_id,title,page_url,torrent_url,info_hash,created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (anime_id, "Nyaa", "hash", "Anime 01", "https://example.test", "magnet:?xt=urn:btih:" + "c" * 40, "c" * 40, main.now()),
+        ).lastrowid
+        conn.execute("INSERT INTO downloads(release_id,torrent_hash,state,save_path) VALUES(?,?,?,?)",
+                     (release_id, "c" * 40, "submitted", str(tmp_path)))
+        conn.commit()
+
+    class FakeQbit:
+        def torrents(self):
+            return [{"hash": "c" * 40, "name": "Anime 01", "progress": 1, "state": "uploading",
+                     "save_path": str(tmp_path)}]
+
+    monkeypatch.setattr(main, "QBitClient", FakeQbit)
+    monkeypatch.setattr(main, "import_completed", lambda: 0)
+    main.monitor_downloads()
+    with main.db() as conn:
+        row = conn.execute("SELECT state,progress,completed_at FROM downloads").fetchone()
+    assert row["state"] == "completed"
+    assert row["progress"] == 1
+    assert row["completed_at"]
+
+
+def test_approval_does_not_duplicate_visible_torrent(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "db.sqlite3"))
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    with main.db() as conn:
+        anime_id = conn.execute(
+            "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("Anime", "Anime", "Anime", main.now(), main.now()),
+        ).lastrowid
+        conn.execute(
+            """INSERT INTO releases(anime_id,source,source_id,title,page_url,torrent_url,info_hash,created_at)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (anime_id, "Nyaa", "hash", "Anime 01", "https://example.test",
+             "magnet:?xt=urn:btih:" + "d" * 40, "d" * 40, main.now()),
+        )
+        conn.commit()
+    class FakeQbit:
+        added = False
+
+        def find(self, info_hash=None):
+            return {"hash": "d" * 40, "state": "downloading"}
+
+        def add(self, *args, **kwargs):
+            self.added = True
+            raise AssertionError("duplicate submission")
+    fake = FakeQbit()
+    monkeypatch.setattr(main, "QBitClient", lambda: fake)
+    response = main.approve(1)
+    assert response.status_code == 303
+    assert fake.added is False
+    with main.db() as conn:
+        assert conn.execute("SELECT status FROM releases").fetchone()[0] == "approved"
+        assert conn.execute("SELECT count(*) FROM downloads").fetchone()[0] == 1
+
+
+def test_import_supports_season_and_multi_episode_without_overwrite(tmp_path, monkeypatch):
+    db_path = tmp_path / "db.sqlite3"
+    download_root = tmp_path / "download"
+    library_root = tmp_path / "library"
+    download_root.mkdir()
+    source = download_root / "Anime.S02E03-E04.mkv"
+    source.write_bytes(b"video")
+    monkeypatch.setattr(main, "DB_PATH", str(db_path))
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "LIBRARY_DIR", library_root)
+    with main.db() as conn:
+        anime_id = conn.execute(
+            "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("Anime", "Anime", "Anime", main.now(), main.now()),
+        ).lastrowid
+        release_id = conn.execute(
+            """INSERT INTO releases(anime_id,source,source_id,title,page_url,created_at)
+               VALUES(?,?,?,?,?,?)""",
+            (anime_id, "Nyaa", "release", "Anime", "https://example.test", main.now()),
+        ).lastrowid
+        conn.execute("INSERT INTO downloads(release_id,state,save_path) VALUES(?,?,?)",
+                     (release_id, "completed", str(download_root)))
+        conn.execute("INSERT INTO settings(key,value) VALUES(?,?)", ("library_dir", str(library_root)))
+        conn.commit()
+    monkeypatch.setattr(main, "inspect_media", lambda path: {
+        "audio": [], "subtitles": [{"codec_name": "ass"}], "english_ass": True, "japanese_ass": True})
+    class FakeJellyfin:
+        def refresh(self):
+            return None
+    monkeypatch.setattr(main, "JellyfinClient", FakeJellyfin)
+    assert main.import_completed() == 1
+    destination = library_root / "Anime" / "Season 02" / "Anime - S02E03-E04.mkv"
+    assert destination.exists()
+    assert source.exists()
+    with main.db() as conn:
+        rows = conn.execute("SELECT season,episode,has_file FROM episodes ORDER BY episode").fetchall()
+        assert [(r["season"], r["episode"], r["has_file"]) for r in rows] == [(2, 3, 1), (2, 4, 1)]
+
+
+def test_import_rejects_non_ass_subtitles(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "db.sqlite3"))
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    source_dir = tmp_path / "download"
+    source_dir.mkdir()
+    (source_dir / "Anime - S01E01.mkv").write_bytes(b"video")
+    with main.db() as conn:
+        anime_id = conn.execute(
+            "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("Anime", "Anime", "Anime", main.now(), main.now()),
+        ).lastrowid
+        release_id = conn.execute(
+            "INSERT INTO releases(anime_id,source,source_id,title,page_url,created_at) VALUES(?,?,?,?,?,?)",
+            (anime_id, "Nyaa", "release", "Anime", "https://example.test", main.now()),
+        ).lastrowid
+        conn.execute("INSERT INTO downloads(release_id,state,save_path) VALUES(?,?,?)",
+                     (release_id, "completed", str(source_dir)))
+        conn.commit()
+    monkeypatch.setattr(main, "inspect_media", lambda path: {
+        "audio": [], "subtitles": [{"codec_name": "subrip", "tags": {"language": "eng"}}],
+        "english_ass": False, "japanese_ass": False})
+    assert main.import_completed() == 0
+    with main.db() as conn:
+        row = conn.execute("SELECT state,error FROM downloads").fetchone()
+    assert row["state"] == "needs_review"
+    assert "ASS/SSA" in row["error"]

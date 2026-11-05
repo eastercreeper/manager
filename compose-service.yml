@@ -26,6 +26,8 @@ services:
       - MIN_QUALITY=1080p
       - SCAN_INTERVAL_MINUTES=30
     volumes:
-      - /mnt/.ix-apps/app_mounts/anime-manager/data:/data
+      - anime_manager_data:/data
       - /mnt/Jellyfin/JellyfinData/JP-BEAN/Shows:/ivan/Shows
       - /mnt/.ix-apps/app_mounts/qbittorrent/downloads:/downloads
+volumes:
+  anime_manager_data:
