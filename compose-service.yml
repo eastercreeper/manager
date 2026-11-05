@@ -1,0 +1,23 @@
+# Merge this service into your EXISTING compose project.
+# Also add "8787:8787/tcp" to the ports list on your existing tailscale service.
+services:
+  anime-manager:
+    container_name: anime-manager
+    build: /mnt/.ix-apps/app_mounts/anime-manager
+    depends_on:
+      - tailscale
+    network_mode: service:tailscale
+    restart: unless-stopped
+    environment:
+      - TZ=America/Los_Angeles
+      - DB_PATH=/data/anime-manager.sqlite3
+      - NYAA_BASE=https://nyaa.si/
+      - QBITTORRENT_URL=http://127.0.0.1:30024
+      - QBITTORRENT_USERNAME=${QBITTORRENT_USERNAME}
+      - QBITTORRENT_PASSWORD=${QBITTORRENT_PASSWORD}
+      - QBITTORRENT_CATEGORY=anime
+      - QBITTORRENT_SAVE_PATH=/downloads/anime
+      - MIN_QUALITY=1080p
+      - SCAN_INTERVAL_MINUTES=30
+    volumes:
+      - /mnt/.ix-apps/app_mounts/anime-manager/data:/data
