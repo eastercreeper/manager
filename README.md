@@ -21,20 +21,14 @@ See [upstream/seanime/UPSTREAM_REVISION](upstream/seanime/UPSTREAM_REVISION).
 
 This project must preserve applicable GPL-3.0-or-later notices, identify modifications to upstream files, and provide corresponding source when distributing covered binaries.
 
-## Current work
+## Implemented on this branch
 
-- Created the isolated `rewrite/go-backend` branch.
-- Imported the complete pinned Seanime source snapshot (including its Go packages, frontend source, module metadata, and license).
-- Added a reproducible GitHub Actions importer so the exact upstream snapshot can be refreshed deliberately.
-- Kept the first Jellyfin API integration package and its tests as a reference for the custom integration layer.
-- Added Go CI for the current custom package.
+- Seanime's pinned Go application is promoted to the repository root and remains the sole application runtime.
+- Jellyfin series/episode synchronization is registered in Seanime's Echo API and uses Seanime's GORM/SQLite database.
+- Jellyfin paths configure Seanime's native anime scanner.
+- Manual AniList overrides, release approvals, qBittorrent handoff, completion reconciliation, and FFprobe subtitle verification are available through the manager extension.
+- A lightweight dashboard is served at `/api/v1/manager/ui`.
+- The Dockerfile builds the upstream React frontend, embeds it in the Go binary, and packages one runtime image.
+- `.env.example`, `compose.example.yaml`, and `docs/MANAGER_API.md` describe configuration and endpoints.
 
-## Next integration work
-
-1. Audit the imported package graph and identify the smallest Seanime anime/metadata/scanner/downloader core that can be built without desktop, playback, and manga runtime features.
-2. Make Seanime's anime models and persistence the application's single database foundation.
-3. Wire Jellyfin library reconciliation into that catalog.
-4. Add manager-only manual AniList mapping, release approval, qBittorrent policy, and media verification.
-5. Replace the current Python Docker build with one Go application image.
-
-No production deployment or existing data has been changed.
+CI is validating frontend build, Go tests, full Go application build, vet, and Docker image build. No production deployment or existing data has been changed.
