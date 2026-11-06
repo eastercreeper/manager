@@ -500,6 +500,98 @@ def library_destination(root: Path, folder_name: str, season: int, filename: str
     return destination_dir / safe_filename(filename)
 
 
+def release_title_matches(show: sqlite3.Row, title: str, aliases: Optional[list[str]] = None) -> bool:
+    """Only accept releases containing the complete tracked title or a known alias."""
+    candidates = [show["title"], show["folder_name"], show["search_query"], *(aliases or [])]
+    normalized_release = normalize_title(title)
+    return any(
+        len(normalize_title(str(candidate or ""))) >= 5
+        and normalize_title(str(candidate or "")) in normalized_release
+        for candidate in candidates
+    )
+
+
+def parse_release_episodes(title: str) -> tuple[Optional[int], list[int]]:
+    """Extract explicit episode numbers/ranges; do not guess from resolution or year."""
+    season = 1
+    sm = re.search(r"(?i)(?:^|[^a-z0-9])s(\d{1,2})(?=e|[^a-z0-9]|$)", title)
+    if sm:
+        season = int(sm.group(1))
+    patterns = [
+        (r"(?i)\bs\d{1,2}\s*e(\d{1,3})(?:\s*[-~&]\s*e?(\d{1,3}))?\b", False),
+        (r"(?i)\b(\d{1,2})x(\d{1,3})(?:\s*[-~&]\s*(?:\d{1,2}x)?(\d{1,3}))?\b", True),
+        (r"(?i)\b(?:episode|ep)\s*[._ -]?(\d{1,3})(?:\s*[-~&]\s*(\d{1,3}))?\b", False),
+        (r"第\s*(\d{1,3})\s*(?:話|集)", False),
+        (r"(?<![A-Za-z0-9])\[(\d{1,3})(?:\s*[~～-]\s*(\d{1,3}))?\]", False),
+    ]
+    for pattern, has_season in patterns:
+        match = re.search(pattern, title)
+        if not match:
+            continue
+        if has_season:
+            season, start = int(match.group(1)), int(match.group(2))
+            end = int(match.group(3) or start)
+        else:
+            start = int(match.group(1))
+            end = int(match.group(2) or start) if match.lastindex and match.lastindex >= 2 else start
+        if start < 1 or end < start or end - start > 100:
+            continue
+        return season, list(range(start, end + 1))
+    return None, []
+
+
+def enrich_release_from_title(release: dict) -> dict:
+    title = str(release.get("title") or "")
+    season, episodes = parse_release_episodes(title)
+    if episodes:
+        release["episode"] = release.get("episode") or episodes[0]
+        release["episode_numbers"] = episodes
+        release["season"] = season or 1
+    if not release.get("quality"):
+        match = re.search(r"(?i)\b(480|720|1080|1440|2160)p\b", title)
+        if match:
+            release["quality"] = match.group(0).lower()
+    if not release.get("codec"):
+        match = re.search(r"(?i)\b(x264|x265|h\.264|h\.265|hevc|av1)\b", title)
+        if match:
+            release["codec"] = match.group(1)
+    if not release.get("group_name"):
+        match = re.match(r"^\[([^\]]{1,50})\]", title)
+        if match:
+            release["group_name"] = match.group(1)
+    lowered = title.lower()
+    if not release.get("audio_hint"):
+        if re.search(r"(?i)dual[- ]audio|multi[- ]audio", title):
+            release["audio_hint"] = "Dual/Multi audio"
+        elif re.search(r"(?i)\b(jpn|japanese)\b", title):
+            release["audio_hint"] = "Japanese"
+    if not release.get("subtitle_hint"):
+        langs = []
+        if re.search(r"(?i)\b(eng|english)\b", title):
+            langs.append("English")
+        if re.search(r"(?i)\b(jpn|japanese)\b", title):
+            langs.append("Japanese")
+        if "multi-sub" in lowered or "multiple subtitle" in lowered or "multi sub" in lowered:
+            release["subtitle_hint"] = "Multiple subtitles" + (": " + ", ".join(langs) if langs else "")
+        elif langs:
+            release["subtitle_hint"] = ", ".join(langs)
+    return release
+
+
+def release_has_missing_episodes(conn: sqlite3.Connection, anime_id: int, title: str) -> bool:
+    season, numbers = parse_release_episodes(title)
+    if not numbers:
+        return False
+    for number in numbers:
+        row = conn.execute(
+            "SELECT status,has_file FROM episodes WHERE anime_id=? AND season=? AND episode=?",
+            (anime_id, season or 1, number),
+        ).fetchone()
+        if not row or row["status"] != "available" or not row["has_file"]:
+            return True
+    return False
+
+
 def score_release(release: dict) -> tuple[float, str]:
     title = " ".join(str(release.get(key, "")) for key in
                      ("title", "audio_hint", "subtitle_hint", "quality")).lower()
@@ -579,6 +671,7 @@ def normalize_release(source: str, item: dict, fallback_url: str = "") -> Option
         "seeders": item.get("seeders") or item.get("seedCount") or 0,
         "leechers": item.get("leechers") or item.get("leechCount") or 0,
     }
+    release = enrich_release_from_title(release)
     release["score"], release["score_reason"] = score_release(release)
     return release
 
@@ -636,8 +729,17 @@ def parse_tsukihime(show: sqlite3.Row) -> list[dict]:
 
 
 def persist_release_search(anime_id: int, query: str) -> list[dict]:
-    releases = parse_nyaa({"search_query": query}) + parse_tsukihime({"search_query": query})
     with DB_LOCK, closing(db()) as conn:
+        show = conn.execute("SELECT * FROM anime WHERE id=?", (anime_id,)).fetchone()
+        if not show:
+            return []
+        aliases = [row["title"] for row in conn.execute(
+            "SELECT title FROM alternate_titles WHERE anime_id=?", (anime_id,)
+        ).fetchall()]
+        releases = parse_nyaa({"search_query": query}) + parse_tsukihime({"search_query": query})
+        releases = [release for release in releases
+                    if release_title_matches(show, release["title"], aliases)
+                    and release_has_missing_episodes(conn, anime_id, release["title"])]
         for release in releases:
             conn.execute("""INSERT OR IGNORE INTO releases(
                 anime_id,source,source_id,title,page_url,torrent_url,info_hash,published,group_name,quality,
@@ -659,7 +761,14 @@ def scan_sources() -> int:
     with DB_LOCK, closing(db()) as conn:
         total = 0
         for show in conn.execute("SELECT * FROM anime").fetchall():
+            aliases = [row["title"] for row in conn.execute(
+                "SELECT title FROM alternate_titles WHERE anime_id=?", (show["id"],)
+            ).fetchall()]
             for release in parse_nyaa(show) + parse_tsukihime(show):
+                if not release_title_matches(show, release["title"], aliases):
+                    continue
+                if not release_has_missing_episodes(conn, show["id"], release["title"]):
+                    continue
                 conn.execute("""INSERT OR IGNORE INTO releases
                   (anime_id,source,source_id,title,page_url,torrent_url,info_hash,published,group_name,quality,
                    episode,audio_hint,subtitle_hint,codec,size_bytes,seeders,leechers,score,score_reason,created_at)
@@ -1302,6 +1411,14 @@ def approve(release_id: int) -> RedirectResponse:
             return RedirectResponse("/", status_code=303)
         if not release["torrent_url"]:
             raise HTTPException(400, "Release has no torrent or magnet URL")
+        show = conn.execute("SELECT * FROM anime WHERE id=?", (release["anime_id"],)).fetchone()
+        aliases = [row["title"] for row in conn.execute(
+            "SELECT title FROM alternate_titles WHERE anime_id=?", (release["anime_id"],)
+        ).fetchall()]
+        if not show or not release_title_matches(show, release["title"], aliases):
+            raise HTTPException(400, "Release title does not match this anime; refusing download")
+        if not release_has_missing_episodes(conn, release["anime_id"], release["title"]):
+            raise HTTPException(400, "Release has no confirmed missing episodes; refusing download")
         try:
             info_hash = release["info_hash"] or release_identity(release["torrent_url"], release["title"])
             existing = client.find(info_hash=info_hash)
