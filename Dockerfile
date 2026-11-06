@@ -1,10 +1,8 @@
 # Build Seanime's existing React frontend first, then embed it into one Go binary.
 FROM node:22-bookworm-slim AS web-build
 WORKDIR /src/seanime-web
-COPY seanime-web/package.json seanime-web/package-lock.json ./
-RUN npm ci
 COPY seanime-web/ ./
-RUN npm run build
+RUN npm ci && npm run build
 WORKDIR /src
 RUN mkdir -p web && cp -a /src/seanime-web/out/. /src/web/
 
