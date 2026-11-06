@@ -752,9 +752,12 @@ def persist_release_search(anime_id: int, query: str) -> list[dict]:
                           release.get("size_bytes"), release.get("seeders"), release.get("leechers"),
                           release["score"], release["score_reason"], now()))
         conn.commit()
-        return [dict(row) for row in conn.execute(
-            "SELECT * FROM releases WHERE anime_id=? AND status='pending' ORDER BY score DESC,id DESC LIMIT 100",
+        pending = [dict(row) for row in conn.execute(
+            "SELECT * FROM releases WHERE anime_id=? AND status='pending' ORDER BY score DESC,id DESC LIMIT 500",
             (anime_id,)).fetchall()]
+        return [release for release in pending
+                if release_title_matches(show, release["title"], aliases)
+                and release_has_missing_episodes(conn, anime_id, release["title"])][:100]
 
 
 def scan_sources() -> int:
