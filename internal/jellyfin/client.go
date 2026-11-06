@@ -112,3 +112,16 @@ func (c *Client) ListEpisodes(ctx context.Context, seriesID string) ([]Item, err
  for i := range response.Items { response.Items[i].SeriesID = seriesID }
  return response.Items, nil
 }
+
+ 
+// RefreshLibrary asks Jellyfin to rescan its configured libraries.
+func (c *Client) RefreshLibrary(ctx context.Context) error {
+ req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/Library/Refresh", nil)
+ if err != nil { return fmt.Errorf("create Jellyfin refresh request: %w", err) }
+ req.Header.Set("X-Emby-Token", c.apiKey)
+ resp, err := c.http.Do(req)
+ if err != nil { return fmt.Errorf("request Jellyfin library refresh: %w", err) }
+ defer resp.Body.Close()
+ if resp.StatusCode < 200 || resp.StatusCode >= 300 { return fmt.Errorf("Jellyfin returned %s refreshing library", resp.Status) }
+ return nil
+}
