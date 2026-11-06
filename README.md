@@ -61,8 +61,8 @@ Jellyfin may report `/ivan/Shows` or `/mnt/Jellyfin/JellyfinData/JP-BEAN/Shows`.
 python -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-pytest -q
+python -m pytest -q
 uvicorn app.main:app --host 0.0.0.0 --port 8787
 ```
 
-The current regression suite covers Jellyfin discovery/path mapping, metadata and custom-folder preservation, AniList search/deduplication, Nyaa/TsukiHime normalization, qBittorrent reconciliation and save paths, CSRF/authentication, episode parsing, path isolation, subtitle verification, partial import retries, and multi-anime importing. GitHub Actions runs `pytest -q` on pushes to `feat/anime-manager-production` and pull requests.
+The current regression suite covers Jellyfin discovery/path mapping, metadata and custom-folder preservation, AniList search/deduplication, Nyaa/TsukiHime normalization, qBittorrent reconciliation and save paths, CSRF/authentication, episode parsing, path isolation, subtitle verification, partial import retries, and multi-anime importing. GitHub Actions runs `python -m pytest -q` with the repository root on `PYTHONPATH` on pushes to `feat/anime-manager-production` and pull requests.

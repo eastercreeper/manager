@@ -4,6 +4,7 @@ import re
 import subprocess
 
 import pytest
+import requests
 
 from app import main
 from fastapi.testclient import TestClient
@@ -436,6 +437,22 @@ def test_retry_partial_import_does_not_duplicate_records(tmp_path, monkeypatch):
     assert (library_root / "Anime" / "Season 01" / "Anime - S01E02.mkv").exists()
 
 
+def test_import_destination_collision_requires_review_without_overwrite(tmp_path, monkeypatch):
+    download_root, library_root = _create_import_download(tmp_path, ["Anime - S01E01.mkv"])
+    destination = library_root / "Anime" / "Season 01" / "Anime - S01E01.mkv"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"unrelated existing media")
+    monkeypatch.setattr(main, "inspect_media", lambda path: {
+        "audio": [], "subtitles": [{"codec_name": "ass"}], "english_ass": True, "japanese_ass": False})
+    assert main.import_completed() == 0
+    assert destination.read_bytes() == b"unrelated existing media"
+    with main.db() as conn:
+        row = conn.execute("SELECT state,error FROM downloads").fetchone()
+        assert row["state"] == "needs_review"
+        assert "already exists" in row["error"]
+        assert conn.execute("SELECT count(*) FROM imported_files").fetchone()[0] == 0
+
+
 def test_external_anime_search_normalizes_anilist_metadata(monkeypatch):
     monkeypatch.setattr(main, "JellyfinClient", lambda: type("J", (), {"search": lambda self, query: []})())
     class Response:
@@ -473,6 +490,53 @@ def test_external_search_deduplicates_provider_result_with_local_title(tmp_path,
     results = main.search_anime("Steins")
     assert len(results) == 1
     assert results[0]["folder_name"] == "Custom"
+
+
+def test_search_form_serializes_anilist_provider_ids_as_json(monkeypatch):
+    monkeypatch.setattr(main, "search_anime", lambda query: [{
+        "title": "External Anime", "folder_name": "External Anime", "year": "2024",
+        "provider_ids": {"AniList": "123"}, "provider_ids_json": '{"AniList": "123"}',
+        "metadata_json": '{"id":123}', "alternate_titles": "日本語タイトル",
+        "jellyfin_id": "",
+    }])
+    response = main.search_page(q="External")
+    html = response.body.decode()
+    assert 'name="provider_ids" value="{&#34;AniList&#34;: &#34;123&#34;}"' in html
+    assert "{'AniList': '123'}" not in html
+
+
+def test_tracking_anilist_result_persists_metadata_and_does_not_download(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "db.sqlite3"))
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    response = main.add_anime(
+        title="External Anime", folder_name="Custom Folder",
+        metadata_json='{"id":123,"description":"Synopsis"}',
+        provider_ids='{"AniList":"123"}',
+        alternate_titles="日本語タイトル\nAlt Title", jellyfin_id="", year="2024",
+    )
+    assert response.status_code == 303
+    with main.db() as conn:
+        anime = conn.execute("SELECT * FROM anime").fetchone()
+        providers = conn.execute("SELECT provider,value FROM provider_ids").fetchall()
+        titles = conn.execute("SELECT title FROM alternate_titles ORDER BY title").fetchall()
+        assert anime["folder_name"] == "Custom Folder"
+        assert anime["year"] == 2024
+        assert '"id": 123' in anime["metadata_json"]
+        assert [(r["provider"], r["value"]) for r in providers] == [("AniList", "123")]
+        assert [r["title"] for r in titles] == ["Alt Title", "日本語タイトル"]
+        assert conn.execute("SELECT count(*) FROM downloads").fetchone()[0] == 0
+
+
+def test_search_anime_external_empty_timeout_and_error_are_graceful(monkeypatch):
+    monkeypatch.setattr(main, "JellyfinClient", lambda: type("J", (), {"search": lambda self, query: []})())
+    monkeypatch.setattr(main, "search_external_anime", lambda query: [])
+    assert main.search_anime("unknown") == []
+    monkeypatch.setattr(main, "search_external_anime", lambda query: (_ for _ in ()).throw(
+        requests.Timeout("timeout")))
+    assert main.search_anime("unknown") == []
+    monkeypatch.setattr(main, "search_external_anime", lambda query: (_ for _ in ()).throw(
+        requests.RequestException("error")))
+    assert main.search_anime("unknown") == []
 
 
 def test_episode_parser_rejects_ambiguous_numbers_and_ignores_resolution():

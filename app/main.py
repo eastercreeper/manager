@@ -766,7 +766,15 @@ def search_anime(query: str) -> list[dict]:
             WHERE a.title LIKE ? OR a.folder_name LIKE ? OR t.title LIKE ?
             ORDER BY a.title LIMIT 50""", (f"%{query}%", f"%{query}%", f"%{query}%")).fetchall()
     for row in rows:
-        results[f"db:{row['id']}"] = dict(row)
+        item = dict(row)
+        with closing(db()) as conn:
+            provider_rows = conn.execute(
+                "SELECT provider,value FROM provider_ids WHERE anime_id=? ORDER BY provider",
+                (row["id"],),
+            ).fetchall()
+        item["provider_ids"] = {r["provider"]: r["value"] for r in provider_rows}
+        item["provider_ids_json"] = json.dumps(item["provider_ids"], ensure_ascii=False)
+        results[f"db:{row['id']}"] = item
     try:
         for item in JellyfinClient().search(query):
             provider_ids = item.get("ProviderIds") or {}
@@ -780,6 +788,7 @@ def search_anime(query: str) -> list[dict]:
                 "title": item.get("Name", ""), "folder_name": Path(item.get("Path", "")).name or item.get("Name", ""),
                 "year": (item.get("PremiereDate") or "")[:4], "jellyfin_id": item.get("Id"),
                 "metadata_json": json.dumps(item), "provider_ids": provider_ids,
+                "provider_ids_json": json.dumps(provider_ids, ensure_ascii=False),
                 "alternate_titles": "\n".join(dict.fromkeys(t for t in alternate_titles if t)),
             }
     except (RuntimeError, ValueError, requests.RequestException):
@@ -843,6 +852,9 @@ def search_external_anime(query: str) -> list[dict]:
             "synopsis": re.sub(r"<[^>]+>", "", item.get("description") or ""),
             "metadata_json": json.dumps(item),
             "provider_ids": {"AniList": str(item.get("id"))} if item.get("id") else {},
+            "provider_ids_json": json.dumps(
+                {"AniList": str(item.get("id"))} if item.get("id") else {}, ensure_ascii=False
+            ),
             "jellyfin_id": "",
             "folder_name": title,
         })
@@ -1194,7 +1206,7 @@ def search_page(q: str = "", release_q: str = "", anime_id: int = 0) -> HTMLResp
             releases = []
     body = template("""<div class="panel"><h2>Search anime</h2>
     <form method="get"><input name="q" value="{{q}}" placeholder="Japanese, English, or alternate title" size="45"><button>Search metadata</button></form>
-    <table><tr><th>Title</th><th>Year</th><th>Provider IDs</th><th>Action</th></tr>{% for item in anime_results %}<tr><td>{{item.title}}{% if item.folder_name and item.folder_name != item.title %}<br><span class="muted">{{item.folder_name}}</span>{% endif %}</td><td>{{item.year or ''}}</td><td>{{item.provider_ids or ''}}</td><td><form method="post" action="/anime"><input type="hidden" name="title" value="{{item.title}}"><input type="hidden" name="metadata_json" value="{{item.metadata_json or '{}'}}"><input type="hidden" name="provider_ids" value="{{item.provider_ids or '{}'}}"><input type="hidden" name="alternate_titles" value="{{item.alternate_titles or ''}}"><input type="hidden" name="jellyfin_id" value="{{item.jellyfin_id or ''}}"><input type="hidden" name="year" value="{{item.year or ''}}"><input name="folder_name" placeholder="Custom folder name"><button>Track anime</button></form></td></tr>{% else %}<tr><td colspan="4">No metadata matches.</td></tr>{% endfor %}</table></div>
+    <table><tr><th>Title</th><th>Year</th><th>Provider IDs</th><th>Action</th></tr>{% for item in anime_results %}<tr><td>{{item.title}}{% if item.folder_name and item.folder_name != item.title %}<br><span class="muted">{{item.folder_name}}</span>{% endif %}</td><td>{{item.year or ''}}</td><td>{{item.provider_ids or ''}}</td><td><form method="post" action="/anime"><input type="hidden" name="title" value="{{item.title}}"><input type="hidden" name="metadata_json" value="{{item.metadata_json or '{}'}}"><input type="hidden" name="provider_ids" value="{{item.provider_ids_json or '{}'}}"><input type="hidden" name="alternate_titles" value="{{item.alternate_titles or ''}}"><input type="hidden" name="jellyfin_id" value="{{item.jellyfin_id or ''}}"><input type="hidden" name="year" value="{{item.year or ''}}"><input name="folder_name" placeholder="Custom folder name"><button>Track anime</button></form></td></tr>{% else %}<tr><td colspan="4">No metadata matches.</td></tr>{% endfor %}</table></div>
     <div class="panel"><h2>Search releases</h2><form method="get"><input name="release_q" value="{{release_q}}" placeholder="Title or identifier" size="45"><select name="anime_id" required><option value="">Track releases for...</option>{% for anime in tracked %}<option value="{{anime.id}}" {% if anime.id == anime_id %}selected{% endif %}>{{anime.title}}</option>{% endfor %}</select><button>Search Nyaa and TsukiHime</button></form>
     <table><tr><th>Release</th><th>Source</th><th>Quality</th><th>Audio/subtitles</th><th>Seeders</th><th>Score</th><th>Action</th></tr>{% for r in releases %}<tr><td><a href="/releases/{{r.id}}">{{r.title}}</a></td><td>{{r.source}}</td><td>{{r.quality}}</td><td>{{r.audio_hint}} / {{r.subtitle_hint}}</td><td>{{r.seeders}}</td><td>{{"%.1f"|format(r.score)}}<br><span class="muted">{{r.score_reason}}</span></td><td><form class="inline" method="post" action="/releases/{{r.id}}/approve"><button>Approve</button></form><form class="inline" method="post" action="/releases/{{r.id}}/reject"><button class="danger">Reject</button></form></td></tr>{% else %}<tr><td colspan="7">No release matches.</td></tr>{% endfor %}</table></div>""").render(
         q=q, release_q=release_q, anime_id=anime_id, tracked=tracked, anime_results=anime_results, releases=releases)
