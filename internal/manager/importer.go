@@ -15,7 +15,9 @@ import (
 	qbmodel "seanime/internal/torrent_clients/qbittorrent/model"
 )
 
-var subtitleExtensions = map[string]bool{".ass": true, ".ssa": true, ".srt": true, ".vtt": true, ".sub": true, ".idx": true}\n\nvar videoExtensions = map[string]bool{
+var subtitleExtensions = map[string]bool{".ass": true, ".ssa": true, ".srt": true, ".vtt": true, ".sub": true, ".idx": true}
+
+var videoExtensions = map[string]bool{
 	".mkv": true, ".mp4": true, ".m4v": true, ".avi": true,
 	".mov": true, ".ts": true, ".webm": true, ".wmv": true,
 	".mpg": true, ".mpeg": true,
