@@ -8,7 +8,8 @@ type JellyfinSeries struct {
  ID uint `gorm:"primaryKey" json:"id"`
  JellyfinID string `gorm:"uniqueIndex;size:128" json:"jellyfinId"`
  Name string `gorm:"size:512" json:"name"`
- Path string `gorm:"size:2048" json:"path"`
+ Path string `gorm:"size:2048" json:"path"` // Original path reported by Jellyfin.
+ ScanPath string `gorm:"size:2048" json:"scanPath,omitempty"` // Container-visible path used by Seanime.
  AniListID int `json:"anilistId,omitempty"`
  MappingSource string `gorm:"size:16;index" json:"mappingSource,omitempty"`
  LastSeenAt time.Time `json:"lastSeenAt"`
