@@ -266,8 +266,17 @@ func copyFileWithoutOverwrite(source, destination string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpName, destination); err != nil {
-		return fmt.Errorf("finalize Jellyfin import: %w", err)
+	// A hard link publishes the fully-written temporary file atomically and,
+	// unlike Rename on Unix, fails rather than replacing a destination created
+	// concurrently after the initial existence check.
+	if err := os.Link(tmpName, destination); err != nil {
+		if os.IsExist(err) {
+			return fmt.Errorf("refusing to overwrite existing Jellyfin file: %s", destination)
+		}
+		return fmt.Errorf("finalize Jellyfin import without overwriting: %w", err)
+	}
+	if err := os.Remove(tmpName); err != nil {
+		return fmt.Errorf("remove temporary import file: %w", err)
 	}
 	return nil
 }
