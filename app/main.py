@@ -1052,6 +1052,9 @@ def anilist_graphql(query: str, variables: dict) -> dict:
                 response.raise_for_status()
         except (AniListRateLimitError, AniListTemporaryError):
             raise
+        except requests.HTTPError:
+            # Do not retry unrelated client errors such as 400, 401, or 404.
+            raise
         except requests.RequestException as exc:
             if attempt >= ANILIST_MAX_RETRIES:
                 raise AniListTemporaryError(str(exc)) from exc
@@ -1153,8 +1156,10 @@ def _refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
     with DB_LOCK, closing(db()) as conn:
         shows = conn.execute("""SELECT a.* FROM anime a LEFT JOIN metadata_sync m ON m.anime_id=a.id
             WHERE ?=1 OR m.anime_id IS NULL OR
-              (m.status IN ('rate_limited','retryable_error') AND m.checked_at < ?) OR
-              (m.status NOT IN ('matched','needs_review','rate_limited','retryable_error') AND m.checked_at < ?)
+              ((m.status IN ('rate_limited','retryable_error') OR
+                (m.status='error' AND m.message LIKE '%429%')) AND m.checked_at < ?) OR
+              (m.status NOT IN ('matched','needs_review','rate_limited','retryable_error') AND
+                NOT (m.status='error' AND m.message LIKE '%429%') AND m.checked_at < ?)
             ORDER BY CASE WHEN m.status IN ('matched','needs_review') THEN 1 ELSE 0 END,a.id LIMIT ?""",
             (int(force), retry_cutoff, cutoff, max(1, int(limit)))).fetchall()
     refreshed = 0
