@@ -14,7 +14,7 @@ small,.muted{color:#a6a8b5}.row{display:flex;flex-wrap:wrap;gap:8px;align-items:
 .error{color:#ff9a9a}pre{white-space:pre-wrap;overflow-wrap:anywhere}
 </style></head><body>
 <h1>Anime Manager</h1><p class="muted">Jellyfin library · AniList overrides · release approvals · media verification</p>
-<section><h2>Connection</h2><div class="row"><label>Manager API token <input id="token" type="password" placeholder="Only if MANAGER_API_TOKEN is set"></label><button id="status">Test Jellyfin</button><button id="sync">Sync library</button><button id="reload">Reload</button></div><p id="message" class="muted">Ready.</p></section>
+<section><h2>Connection</h2><div class="row"><label>Manager API token <input id="token" type="password" placeholder="Only if MANAGER_API_TOKEN is set"></label><button id="status">Test Jellyfin</button><button id="sync">Sync library</button><button id="reconcile">Reconcile downloads</button><button id="reload">Reload</button></div><p id="message" class="muted">Ready.</p></section>
 <section><h2>Library and manual AniList mapping</h2><div id="library">Load the library to begin.</div></section>
 <section><h2>Submit a release for approval</h2><form id="release" class="row">
 <input name="title" placeholder="Release title" required><input name="link" placeholder="magnet or torrent URL" required>
@@ -31,6 +31,7 @@ async function loadLibrary(){const data=await api('/library');const root=$('libr
 async function loadApprovals(){const data=await api('/approvals');const root=$('approvals');root.replaceChildren();for(const a of data){const row=el('div','', 'item'),left=el('div');left.append(el('strong',a.title));left.append(el('div',a.status+' · '+a.savePath,'muted'));row.append(left);if(a.status==='pending'){for(const action of ['approve','reject']){const b=el('button',action);b.onclick=async()=>{try{await api('/approvals/'+a.id+'/'+action,{method:'POST'});say('Release '+action+'d');await loadApprovals()}catch(err){say(err.message)}};row.append(b)}}root.append(row)}if(!data.length)root.textContent='No releases awaiting review.'}
 $('status').onclick=async()=>{try{const x=await api('/jellyfin/status');say('Connected to '+x.ServerName+' · Jellyfin '+x.Version)}catch(e){say(e.message)}};
 $('sync').onclick=async()=>{try{const x=await api('/jellyfin/sync',{method:'POST'});say('Synced '+x.series+' series and '+x.episodes+' episodes');await loadLibrary()}catch(e){say(e.message)}};
+$('reconcile').onclick=async()=>{try{const x=await api('/downloads/reconcile',{method:'POST'});say('Checked '+x.checked+' approvals; newly completed: '+x.newlyDownloaded+'. '+x.note);await loadApprovals()}catch(e){say(e.message)}};
 $('reload').onclick=async()=>{try{await loadLibrary();await loadApprovals();say('Reloaded')}catch(e){say(e.message)}};
 $('release').onsubmit=async e=>{e.preventDefault();const f=new FormData(e.target),v=Object.fromEntries(f.entries());v.mediaId=Number(v.mediaId||0);v.episodeNumber=Number(v.episodeNumber||0);try{await api('/approvals',{method:'POST',body:JSON.stringify(v)});e.target.reset();say('Release queued for approval');await loadApprovals()}catch(err){say(err.message)}};
 loadLibrary().catch(e=>say(e.message));loadApprovals().catch(e=>say(e.message));
