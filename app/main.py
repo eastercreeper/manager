@@ -1294,7 +1294,7 @@ def background_sync() -> None:
     except (RuntimeError, requests.RequestException, sqlite3.Error) as exc:
         print(f"Jellyfin sync failed: {exc}", flush=True)
     try:
-        refreshed = refresh_anilist_expectations(limit=3)
+        refreshed = refresh_anilist_expectations(limit=10)
         if refreshed:
             print(f"AniList metadata reconciled for {refreshed} anime", flush=True)
     except (RuntimeError, ValueError, requests.RequestException, sqlite3.Error) as exc:
