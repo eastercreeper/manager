@@ -784,7 +784,69 @@ def search_anime(query: str) -> list[dict]:
             }
     except (RuntimeError, ValueError, requests.RequestException):
         pass
+    try:
+        for item in search_external_anime(query):
+            provider_key = next(iter(item.get("provider_ids", {}).items()), ("", ""))
+            matching_key = next(
+                (key for key, existing in results.items()
+                 if (provider_key[1] and provider_key[1] in (existing.get("provider_ids") or {}).values())
+                 or normalize_title(existing.get("title", "")) == normalize_title(item["title"])),
+                None,
+            )
+            if matching_key:
+                results[matching_key].update({
+                    k: v for k, v in item.items()
+                    if v not in (None, "", {}, []) and not (matching_key.startswith("db:") and k == "folder_name")
+                })
+            else:
+                key = f"external:{provider_key[0]}:{provider_key[1]}" if provider_key[1] else f"external:{normalize_title(item['title'])}"
+                results[key] = item
+    except (RuntimeError, ValueError, requests.RequestException):
+        pass
     return list(results.values())
+
+
+def search_external_anime(query: str) -> list[dict]:
+    response = requests.post(
+        "https://graphql.anilist.co",
+        json={"query": """query ($search: String) {
+            Page(perPage: 20) {
+                media(search: $search, type: ANIME) {
+                    id title { romaji english native userPreferred }
+                    synonyms startDate { year } description
+                }
+            }
+        }""", "variables": {"search": query}},
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("errors"):
+        raise RuntimeError("External anime metadata provider returned an error")
+    media_items = payload.get("data", {}).get("Page", {}).get("media", [])
+    results = []
+    for item in media_items if isinstance(media_items, list) else []:
+        title_data = item.get("title") or {}
+        title = title_data.get("english") or title_data.get("romaji") or title_data.get("native") or ""
+        if not title:
+            continue
+        alternates = []
+        for value in (title_data.get("romaji"), title_data.get("english"), title_data.get("native"),
+                      title_data.get("userPreferred"), *(item.get("synonyms") or [])):
+            if value and value not in alternates and value != title:
+                alternates.append(value)
+        results.append({
+            "title": title,
+            "japanese_title": title_data.get("native") or "",
+            "alternate_titles": "\n".join(alternates),
+            "year": str((item.get("startDate") or {}).get("year") or ""),
+            "synopsis": re.sub(r"<[^>]+>", "", item.get("description") or ""),
+            "metadata_json": json.dumps(item),
+            "provider_ids": {"AniList": str(item.get("id"))} if item.get("id") else {},
+            "jellyfin_id": "",
+            "folder_name": title,
+        })
+    return results
 
 
 def import_completed() -> int:
@@ -811,23 +873,23 @@ def import_completed() -> int:
             ]
             library_root = Path(setting(conn, "library_dir", str(LIBRARY_DIR))).resolve()
             imported_files_for_download = 0
-            verification_failed = False
+            failed_files = []
             for source in files:
                 if not path_is_within(download_root, source):
-                    verification_failed = True
+                    failed_files.append(f"{source}: path escapes download directory")
                     conn.execute("UPDATE downloads SET state='needs_review',error=? WHERE id=?",
                                  ("Torrent content escapes the configured download directory", download["id"]))
                     continue
                 season, episode_numbers = parse_file_episodes(source)
                 if not episode_numbers:
-                    verification_failed = True
+                    failed_files.append(f"{source}: episode number is ambiguous")
                     conn.execute("UPDATE downloads SET state='needs_review',error=? WHERE id=?",
                                  ("Could not identify season/episode from media filename", download["id"]))
                     continue
                 try:
                     media = inspect_media(source)
                 except (OSError, subprocess.SubprocessError, ValueError) as exc:
-                    verification_failed = True
+                    failed_files.append(f"{source}: {exc}")
                     conn.execute("INSERT INTO media_verifications(download_id,file_path,audio_json,subtitle_json,error,verified_at) VALUES(?,?,?,?,?,?)",
                                  (download["id"], str(source), "[]", "[]", str(exc), now()))
                     conn.execute("UPDATE downloads SET state='needs_review',error=? WHERE id=?",
@@ -839,7 +901,7 @@ def import_completed() -> int:
                     (download["id"], str(source), json.dumps(media["audio"]), json.dumps(media["subtitles"]),
                      media["english_ass"], media["japanese_ass"], accepted, now()))
                 if not accepted:
-                    verification_failed = True
+                    failed_files.append(f"{source}: English ASS/SSA subtitle not found")
                     conn.execute("UPDATE downloads SET state='needs_review',error=? WHERE id=?",
                                  ("English ASS/SSA subtitle not found", download["id"]))
                     continue
@@ -850,6 +912,16 @@ def import_completed() -> int:
                     destination_name = f"{safe_folder(download['title'])} - S{season:02d}E{episode_numbers[0]:02d}{source.suffix.lower()}"
                 destination = library_destination(library_root, download["folder_name"], season, destination_name)
                 if destination.exists():
+                    recorded = conn.execute(
+                        "SELECT 1 FROM imported_files WHERE anime_id=? AND source_path=? AND destination_path=?",
+                        (download["anime_id"], str(source), str(destination)),
+                    ).fetchone()
+                    if recorded:
+                        imported_files_for_download += 1
+                        continue
+                    failed_files.append(f"{source}: destination already exists")
+                    conn.execute("UPDATE downloads SET state='needs_review',error=? WHERE id=?",
+                                 (f"Import destination already exists: {destination}", download["id"]))
                     continue
                 partial = destination.with_name(destination.name + ".partial")
                 try:
@@ -858,6 +930,7 @@ def import_completed() -> int:
                 except OSError as exc:
                     if partial.exists():
                         partial.unlink()
+                    failed_files.append(f"{source}: copy failed: {exc}")
                     conn.execute("UPDATE downloads SET state='needs_review',error=? WHERE id=?",
                                  (f"Import failed: {exc}", download["id"]))
                     continue
@@ -875,13 +948,14 @@ def import_completed() -> int:
                     conn.execute("INSERT OR IGNORE INTO imported_files(anime_id,episode_id,source_path,destination_path,imported_at) VALUES(?,?,?,?,?)",
                                  (download["anime_id"], episode_id, str(source), str(destination), now()))
                 imported_files_for_download += 1
-            if imported_files_for_download:
+            if failed_files:
+                conn.execute("UPDATE downloads SET state='needs_review',error=? WHERE id=?",
+                             ("; ".join(failed_files), download["id"]))
+                imported += imported_files_for_download
+            elif imported_files_for_download:
                 conn.execute("UPDATE downloads SET imported_at=?,state='imported' WHERE id=?",
                              (now(), download["id"]))
                 imported += imported_files_for_download
-            elif files and not verification_failed and not conn.execute("SELECT 1 FROM imported_files WHERE anime_id=? AND source_path IN ({})".format(
-                    ",".join("?" for _ in files)), (download["anime_id"], *[str(p) for p in files])).fetchone():
-                conn.execute("UPDATE downloads SET state='already_imported' WHERE id=?", (download["id"],))
             elif not files:
                 conn.execute("UPDATE downloads SET state='needs_review',error=? WHERE id=?",
                              ("No media files were found in the torrent content path", download["id"]))

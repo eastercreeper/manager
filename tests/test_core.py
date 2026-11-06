@@ -353,6 +353,128 @@ def test_import_uses_each_torrent_content_path_for_two_anime(tmp_path, monkeypat
     assert not (library_root / "Alpha" / "Season 01" / "Beta - S01E02.mkv").exists()
 
 
+def _create_import_download(tmp_path, files):
+    download_root = tmp_path / "downloads"
+    library_root = tmp_path / "library"
+    download_root.mkdir()
+    for name in files:
+        (download_root / name).write_bytes(b"video")
+    main.DB_PATH = str(tmp_path / "db.sqlite3")
+    main.DATA_DIR = tmp_path
+    with main.db() as conn:
+        anime_id = conn.execute(
+            "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("Anime", "Anime", "Anime", main.now(), main.now()),
+        ).lastrowid
+        release_id = conn.execute(
+            "INSERT INTO releases(anime_id,source,source_id,title,page_url,created_at) VALUES(?,?,?,?,?,?)",
+            (anime_id, "Nyaa", "release", "Anime", "https://example.test", main.now()),
+        ).lastrowid
+        conn.execute("INSERT INTO downloads(release_id,state,save_path,content_path) VALUES(?,?,?,?)",
+                     (release_id, "completed", str(download_root), str(download_root)))
+        conn.execute("INSERT INTO settings(key,value) VALUES(?,?)", ("library_dir", str(library_root)))
+        conn.commit()
+    return download_root, library_root
+
+
+def test_partial_import_marks_review_and_records_failed_file(tmp_path, monkeypatch):
+    download_root, library_root = _create_import_download(
+        tmp_path, ["Anime - S01E01.mkv", "Anime - S01E02.mkv"])
+    monkeypatch.setattr(main, "inspect_media", lambda path: {
+        "audio": [], "subtitles": [{"codec_name": "ass"}], "english_ass": True, "japanese_ass": False})
+    original_copy = main.shutil.copy2
+    def copy_with_failure(source, destination):
+        if source.name.endswith("E02.mkv"):
+            raise OSError("simulated copy failure")
+        return original_copy(source, destination)
+    monkeypatch.setattr(main.shutil, "copy2", copy_with_failure)
+    assert main.import_completed() == 1
+    with main.db() as conn:
+        row = conn.execute("SELECT state,imported_at,error FROM downloads").fetchone()
+        assert row["state"] == "needs_review"
+        assert row["imported_at"] is None
+        assert "E02.mkv" in row["error"]
+        assert conn.execute("SELECT count(*) FROM imported_files").fetchone()[0] == 1
+    assert (library_root / "Anime" / "Season 01" / "Anime - S01E01.mkv").exists()
+    assert not (library_root / "Anime" / "Season 01" / "Anime - S01E02.mkv").exists()
+
+
+def test_all_failed_imports_never_become_already_imported(tmp_path, monkeypatch):
+    download_root, _ = _create_import_download(
+        tmp_path, ["Anime - S01E01.mkv", "Anime - S01E02.mkv"])
+    monkeypatch.setattr(main, "inspect_media", lambda path: {
+        "audio": [], "subtitles": [{"codec_name": "ass"}], "english_ass": True, "japanese_ass": False})
+    monkeypatch.setattr(main.shutil, "copy2", lambda source, destination: (_ for _ in ()).throw(OSError("copy failed")))
+    assert main.import_completed() == 0
+    with main.db() as conn:
+        row = conn.execute("SELECT state,imported_at,error FROM downloads").fetchone()
+    assert row["state"] == "needs_review"
+    assert row["imported_at"] is None
+    assert "copy failed" in row["error"]
+
+
+def test_retry_partial_import_does_not_duplicate_records(tmp_path, monkeypatch):
+    download_root, library_root = _create_import_download(tmp_path, ["Anime - S01E01.mkv", "Anime - S01E02.mkv"])
+    monkeypatch.setattr(main, "inspect_media", lambda path: {
+        "audio": [], "subtitles": [{"codec_name": "ass"}], "english_ass": True, "japanese_ass": False})
+    original_copy = main.shutil.copy2
+    monkeypatch.setattr(main.shutil, "copy2", lambda source, destination:
+                        (_ for _ in ()).throw(OSError("first attempt")) if source.name.endswith("E02.mkv")
+                        else original_copy(source, destination))
+    assert main.import_completed() == 1
+    monkeypatch.setattr(main.shutil, "copy2", original_copy)
+    with main.db() as conn:
+        conn.execute("UPDATE downloads SET state='completed' WHERE state='needs_review'")
+        conn.commit()
+    assert main.import_completed() == 2
+    with main.db() as conn:
+        row = conn.execute("SELECT state,imported_at FROM downloads").fetchone()
+        assert row["state"] == "imported"
+        assert row["imported_at"]
+        assert conn.execute("SELECT count(*) FROM imported_files").fetchone()[0] == 2
+        assert conn.execute("SELECT count(*) FROM episodes").fetchone()[0] == 2
+    assert (library_root / "Anime" / "Season 01" / "Anime - S01E02.mkv").exists()
+
+
+def test_external_anime_search_normalizes_anilist_metadata(monkeypatch):
+    monkeypatch.setattr(main, "JellyfinClient", lambda: type("J", (), {"search": lambda self, query: []})())
+    class Response:
+        def raise_for_status(self):
+            return None
+        def json(self):
+            return {"data": {"Page": {"media": [{
+                "id": 123, "title": {"english": "Steins;Gate", "romaji": "Steins;Gate",
+                "native": "シュタインズ・ゲート", "userPreferred": "Steins;Gate"},
+                "synonyms": ["シュタゲ"], "startDate": {"year": 2011},
+                "description": "<p>A story.</p>",
+            }]}}}
+    monkeypatch.setattr(main.requests, "post", lambda *args, **kwargs: Response())
+    results = main.search_anime("Steins")
+    assert results[0]["provider_ids"] == {"AniList": "123"}
+    assert results[0]["japanese_title"] == "シュタインズ・ゲート"
+    assert "シュタゲ" in results[0]["alternate_titles"]
+    assert results[0]["synopsis"] == "A story."
+
+
+def test_external_search_deduplicates_provider_result_with_local_title(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "db.sqlite3"))
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    with main.db() as conn:
+        conn.execute(
+            "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("Steins;Gate", "Custom", "Steins", main.now(), main.now()),
+        )
+        conn.commit()
+    monkeypatch.setattr(main, "JellyfinClient", lambda: type("J", (), {"search": lambda self, query: []})())
+    monkeypatch.setattr(main, "search_external_anime", lambda query: [{
+        "title": "Steins;Gate", "provider_ids": {"AniList": "123"},
+        "alternate_titles": "シュタゲ", "metadata_json": "{}", "folder_name": "Steins;Gate",
+    }])
+    results = main.search_anime("Steins")
+    assert len(results) == 1
+    assert results[0]["folder_name"] == "Custom"
+
+
 def test_episode_parser_rejects_ambiguous_numbers_and_ignores_resolution():
     assert main.parse_file_episodes(Path("Show - S01E03 [1080p][x265].mkv")) == (1, [3])
     assert main.parse_file_episodes(Path("Show - EP04 [720p].mkv")) == (1, [4])

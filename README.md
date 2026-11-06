@@ -46,7 +46,9 @@ Jellyfin may report `/ivan/Shows` or `/mnt/Jellyfin/JellyfinData/JP-BEAN/Shows`.
 - `ADMIN_PASSWORD` is intentionally required to enable browser authentication; without it the app remains suitable only for a trusted private network.
 - Releases are only candidates until manually approved.
 - Completed files without English ASS/SSA are flagged for review and are not imported.
-- The Search page uses Jellyfin/tracked metadata; it is not a general-purpose external metadata catalog.
+- The Search page combines local/tracked metadata, Jellyfin, and AniList external metadata. AniList search is unauthenticated and subject to its public rate limits; provider timeouts and API errors are treated as an empty external result set while local/Jellyfin results remain available.
+- External results preserve AniList IDs, Japanese/native titles, alternate titles, year, synopsis, and raw metadata. Tracking requires an explicit **Track Anime** action and still requires a custom or default folder name; it never submits a download.
+- A partial import is retained in `needs_review` with per-file failure details. Retrying after the source is available reuses recorded successful files, skips existing destinations without overwriting them, and imports only the remaining files.
 - Jellyfin-reported host paths are translated through `JELLYFIN_PATH_PREFIXES`; both `/ivan/Shows` and the default `/mnt/Jellyfin/JellyfinData/JP-BEAN/Shows` mapping are supported.
 - The published TsukiHime host was DNS-unavailable during this audit, so live connectivity could not be verified here. The adapter is schema-driven and covered by mocked OpenAPI/API tests; it does not invent a fixed search endpoint.
 - TsukiHime is isolated behind its adapter and fails closed if its published OpenAPI schema has no compatible search/release endpoint.
@@ -63,4 +65,4 @@ pytest -q
 uvicorn app.main:app --host 0.0.0.0 --port 8787
 ```
 
-The current regression suite covers Jellyfin discovery/path mapping, metadata and custom-folder preservation, Nyaa/TsukiHime normalization, qBittorrent reconciliation and save paths, CSRF/authentication, episode parsing, path isolation, subtitle verification, and multi-anime importing.
+The current regression suite covers Jellyfin discovery/path mapping, metadata and custom-folder preservation, AniList search/deduplication, Nyaa/TsukiHime normalization, qBittorrent reconciliation and save paths, CSRF/authentication, episode parsing, path isolation, subtitle verification, partial import retries, and multi-anime importing. GitHub Actions runs `pytest -q` on pushes to `feat/anime-manager-production` and pull requests.
