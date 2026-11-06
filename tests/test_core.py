@@ -74,7 +74,7 @@ def test_jellyfin_client_connectivity_and_shows_library(monkeypatch):
     monkeypatch.setattr(main.requests, "request", request)
     client = main.JellyfinClient("http://jellyfin:8096", "secret")
     assert client.shows_library()["ItemId"] == "s"
-    assert calls[0][2]["headers"]["X-Emby-Token"] == "secret"
+    assert calls[0][2]["headers"]["Authorization"] == 'MediaBrowser Token="secret"'
 
 
 def test_jellyfin_sync_discovers_series_and_scans_files(tmp_path, monkeypatch):
@@ -222,7 +222,7 @@ def test_approval_does_not_duplicate_visible_torrent(tmp_path, monkeypatch):
         conn.execute(
             """INSERT INTO releases(anime_id,source,source_id,title,page_url,torrent_url,info_hash,created_at)
                VALUES(?,?,?,?,?,?,?,?)""",
-            (anime_id, "Nyaa", "hash", "Anime 01", "https://example.test",
+            (anime_id, "Nyaa", "hash", "Anime - 01", "https://example.test",
              "magnet:?xt=urn:btih:" + "d" * 40, "d" * 40, main.now()),
         )
         conn.commit()
@@ -828,3 +828,63 @@ def test_release_search_persists_candidates_for_selected_anime(tmp_path, monkeyp
     main.persist_release_search(anime_id, "Anime")
     with main.db() as conn:
         assert conn.execute("SELECT count(*) FROM releases").fetchone()[0] == 1
+
+
+def test_anilist_sequel_chain_maps_missing_season_without_guessing(monkeypatch):
+    root = {
+        "id": 1, "episodes": 12, "format": "TV",
+        "title": {"english": "Unnamed Memory", "romaji": "Unnamed Memory"},
+        "relations": {"edges": [{
+            "relationType": "SEQUEL",
+            "node": {"id": 2, "type": "ANIME", "episodes": 12, "format": "TV",
+                     "title": {"english": "Unnamed Memory Act 2", "romaji": "Unnamed Memory Act 2"}},
+        }]},
+    }
+    sequel = {
+        "id": 2, "episodes": 12, "format": "TV",
+        "title": {"english": "Unnamed Memory Act 2", "romaji": "Unnamed Memory Act 2"},
+        "relations": {"edges": []},
+    }
+    monkeypatch.setattr(main, "anilist_media", lambda media_id: sequel if media_id == 2 else root)
+    chain, unambiguous = main.resolve_anilist_chain(root)
+    assert unambiguous is True
+    assert [item["id"] for item in chain] == [1, 2]
+
+
+def test_anilist_sequel_chain_flags_ambiguous_tv_branches():
+    root = {
+        "id": 1, "episodes": 12, "format": "TV",
+        "title": {"english": "Example Anime"},
+        "relations": {"edges": [
+            {"relationType": "SEQUEL", "node": {"id": 2, "type": "ANIME", "episodes": 12,
+             "format": "TV", "title": {"english": "Example Anime Season 2"}}},
+            {"relationType": "SEQUEL", "node": {"id": 3, "type": "ANIME", "episodes": 12,
+             "format": "TV", "title": {"english": "Example Anime Season 3"}}},
+        ]},
+    }
+    chain, unambiguous = main.resolve_anilist_chain(root)
+    assert chain == [root]
+    assert unambiguous is False
+
+
+def test_metadata_page_reports_episode_number_gaps(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "db.sqlite3"))
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    with main.db() as conn:
+        anime_id = conn.execute(
+            "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("Example Anime", "Example Anime", "Example Anime", main.now(), main.now()),
+        ).lastrowid
+        conn.execute("""INSERT INTO expected_seasons
+            (anime_id,season,expected_count,anilist_id,metadata_title,updated_at)
+            VALUES(?,?,?,?,?,?)""", (anime_id, 1, 3, 100, "Example Anime", main.now()))
+        for number in (1, 3):
+            conn.execute("""INSERT INTO episodes
+                (anime_id,season,episode,status,has_file) VALUES(?,?,?,?,1)""",
+                (anime_id, 1, number, "available"))
+        conn.commit()
+    html = main.metadata_page().body.decode()
+    assert "2 missing" in html
+    assert "<td>2</td>" in html
+
+
