@@ -38,3 +38,5 @@ jobs:
         run: go build -trimpath -o /tmp/anime-manager .
       - name: Vet manager integration
         run: go vet ./internal/jellyfin/... ./internal/manager/...
+      - name: Build container image
+        run: docker build -t anime-manager:ci .
