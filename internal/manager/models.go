@@ -10,6 +10,7 @@ type JellyfinSeries struct {
  Name string `gorm:"size:512" json:"name"`
  Path string `gorm:"size:2048" json:"path"`
  AniListID int `json:"anilistId,omitempty"`
+ MappingSource string `gorm:"size:16;index" json:"mappingSource,omitempty"`
  LastSeenAt time.Time `json:"lastSeenAt"`
  CreatedAt time.Time `json:"createdAt"`
  UpdatedAt time.Time `json:"updatedAt"`
