@@ -35,6 +35,7 @@ func Register(app *core.App, v1 *echo.Group) {
   if err!=nil { app.Logger.Error().Err(err).Msg("manager: invalid Jellyfin configuration") } else { s.jf=client }
  }
  g:=v1.Group("/manager")
+ if token:=strings.TrimSpace(os.Getenv("MANAGER_API_TOKEN")); token!="" { g.Use(func(next echo.HandlerFunc) echo.HandlerFunc { return func(c echo.Context) error { if c.Request().Header.Get("Authorization")!="Bearer "+token { return c.JSON(401,map[string]string{"error":"unauthorized"}) }; return next(c) } }) }
  g.GET("/health",s.health)
  g.GET("/jellyfin/status",s.jellyfinStatus)
  g.POST("/jellyfin/sync",s.syncJellyfin)
@@ -46,7 +47,6 @@ func Register(app *core.App, v1 *echo.Group) {
  g.POST("/approvals/:id/reject",s.reject)
  g.POST("/episodes/:jellyfinId/verify",s.verifyEpisode)
  g.POST("/downloads/reconcile",s.reconcileDownloads)
- if token:=strings.TrimSpace(os.Getenv("MANAGER_API_TOKEN")); token!="" { g.Use(func(next echo.HandlerFunc) echo.HandlerFunc { return func(c echo.Context) error { if c.Request().Header.Get("Authorization")!="Bearer "+token { return c.JSON(401,map[string]string{"error":"unauthorized"}) }; return next(c) } }) }
 }
 func (s *Service) jellyfin() (*jellyfin.Client,error) {
  if s.jf==nil { return nil,errors.New("configure JELLYFIN_URL and JELLYFIN_API_KEY") }; return s.jf,nil
