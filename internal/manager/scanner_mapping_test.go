@@ -31,3 +31,27 @@ func TestApplySeriesOverridesDoesNotMatchPathPrefixCollision(t *testing.T) {
 		t.Fatalf("path-prefix collision incorrectly mapped media ID %d", local.MediaId)
 	}
 }
+
+func TestMatchedMediaIDsForPathCollectsUniqueMatches(t *testing.T) {
+	root := t.TempDir()
+	season := filepath.Join(root, "Season 01")
+	one := &anime.LocalFile{Path: filepath.Join(season, "one.mkv"), MediaId: 42}
+	two := &anime.LocalFile{Path: filepath.Join(season, "two.mkv"), MediaId: 42}
+	outside := &anime.LocalFile{Path: root + "-other/three.mkv", MediaId: 99}
+	ids := matchedMediaIDsForPath([]*anime.LocalFile{one, two, outside}, root)
+	if len(ids) != 1 || !ids[42] {
+		t.Fatalf("matched IDs = %v, want only 42", ids)
+	}
+}
+
+func TestMatchedMediaIDsForPathKeepsAmbiguousMatchesVisible(t *testing.T) {
+	root := t.TempDir()
+	files := []*anime.LocalFile{
+		{Path: filepath.Join(root, "one.mkv"), MediaId: 42},
+		{Path: filepath.Join(root, "two.mkv"), MediaId: 84},
+	}
+	ids := matchedMediaIDsForPath(files, root)
+	if len(ids) != 2 {
+		t.Fatalf("matched IDs = %v, want both ambiguous IDs", ids)
+	}
+}
