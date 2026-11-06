@@ -16,6 +16,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: seanime-web/package-lock.json
+      - name: Build Seanime frontend for embedding
+        working-directory: seanime-web
+        run: |
+          npm ci
+          npm run build
+          mkdir -p ../web
+          cp -a out/. ../web/
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
