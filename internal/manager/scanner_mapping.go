@@ -79,4 +79,47 @@ func (s *Service) installScannerMappingHook() {
 		}
 		return resolver.Next()
 	})
+
+	// Also apply overrides after Seanime merges locked/skipped files back into
+	// the scan result. Those files bypass the matching phase above.
+	hook.GlobalHookManager.OnScanCompleted().BindFunc(func(resolver hook_resolver.Resolver) error {
+		event, ok := resolver.(*scanner.ScanCompletedEvent)
+		if !ok {
+			return resolver.Next()
+		}
+		var shows []JellyfinSeries
+		if err := s.db.Where("ani_list_id > 0").Find(&shows).Error; err != nil {
+			s.app.Logger.Error().Err(err).Msg("manager: load AniList overrides for completed scan")
+			return resolver.Next()
+		}
+		applySeriesOverrides(event.LocalFiles, shows)
+		return resolver.Next()
+	})
+}
+
+func applySeriesOverrides(localFiles []*anime.LocalFile, shows []JellyfinSeries) {
+	sort.Slice(shows, func(i, j int) bool { return len(shows[i].Path) > len(shows[j].Path) })
+	for _, localFile := range localFiles {
+		if localFile == nil {
+			continue
+		}
+		filePath, err := filepath.Abs(filepath.Clean(localFile.Path))
+		if err != nil {
+			continue
+		}
+		for _, show := range shows {
+			if show.AniListID <= 0 || strings.TrimSpace(show.Path) == "" {
+				continue
+			}
+			root, err := filepath.Abs(filepath.Clean(show.Path))
+			if err != nil {
+				continue
+			}
+			rel, err := filepath.Rel(root, filePath)
+			if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				localFile.MediaId = show.AniListID
+				break
+			}
+		}
+	}
 }
