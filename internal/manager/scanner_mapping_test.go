@@ -2,6 +2,7 @@ package manager
 
 import (
 	"path/filepath"
+	"os"
 	"testing"
 
 	"seanime/internal/library/anime"
@@ -53,5 +54,37 @@ func TestMatchedMediaIDsForPathKeepsAmbiguousMatchesVisible(t *testing.T) {
 	ids := matchedMediaIDsForPath(files, root)
 	if len(ids) != 2 {
 		t.Fatalf("matched IDs = %v, want both ambiguous IDs", ids)
+	}
+}
+
+func TestResolveJellyfinPathUsesConfiguredMount(t *testing.T) {
+	root := t.TempDir()
+	shows := filepath.Join(root, "Shows")
+	if err := os.MkdirAll(filepath.Join(shows, "Example Anime"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("JELLYFIN_PATH_MAP", "/SMB/JP-BEAN="+root)
+	got := resolveJellyfinPath("/SMB/JP-BEAN/Shows/Example Anime")
+	want := filepath.Join(shows, "Example Anime")
+	if got != want {
+		t.Fatalf("resolved path = %q, want %q", got, want)
+	}
+}
+
+func TestResolveJellyfinPathDoesNotMatchPrefixCollision(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("JELLYFIN_PATH_MAP", "/SMB/JP-BEAN="+root)
+	got := resolveJellyfinPath("/SMB/JP-BEANS/Shows")
+	if got != "/SMB/JP-BEANS/Shows" {
+		t.Fatalf("prefix collision resolved to %q", got)
+	}
+}
+
+func TestResolveJellyfinPathPrefersExistingContainerPath(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("JELLYFIN_PATH_MAP", "/SMB/JP-BEAN=/wrong")
+	got := resolveJellyfinPath(root)
+	if got != root {
+		t.Fatalf("existing path resolved to %q, want %q", got, root)
 	}
 }
