@@ -213,6 +213,7 @@ def test_monitor_reconciles_delayed_torrent_visibility(tmp_path, monkeypatch):
 def test_approval_does_not_duplicate_visible_torrent(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "db.sqlite3"))
     monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "QBT_SAVE_PATH", tmp_path / "downloads" / "anime")
     with main.db() as conn:
         anime_id = conn.execute(
             "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
