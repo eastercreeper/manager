@@ -110,10 +110,12 @@ func (s *Service) library(c echo.Context) error {
 }
 func (s *Service) setMapping(c echo.Context) error {
  id:=strings.TrimSpace(c.Param("jellyfinId"));var body struct{AniListID int `json:"anilistId"`}
- if id==""||c.Bind(&body)!=nil||body.AniListID<=0{return c.JSON(400,map[string]string{"error":"jellyfinId and positive anilistId are required"})}
+ if id==""||c.Bind(&body)!=nil||body.AniListID<0{return c.JSON(400,map[string]string{"error":"jellyfinId and a non-negative anilistId are required; use 0 to clear a mapping"})}
  r:=s.db.Model(&JellyfinSeries{}).Where("jellyfin_id = ?",id).Update("ani_list_id",body.AniListID)
  if r.Error!=nil{return c.JSON(500,map[string]string{"error":r.Error.Error()})};if r.RowsAffected==0{return c.JSON(404,map[string]string{"error":"series not found; sync Jellyfin first"})}
- return c.JSON(200,map[string]any{"jellyfinId":id,"anilistId":body.AniListID})
+ queued:=s.app.AutoScanner!=nil
+ if queued{go s.app.AutoScanner.RunNow()}
+ return c.JSON(200,map[string]any{"jellyfinId":id,"anilistId":body.AniListID,"scanQueued":queued})
 }
 func (s *Service) listApprovals(c echo.Context) error {
  var rows []ReleaseApproval;if err:=s.db.Order("created_at desc").Limit(500).Find(&rows).Error;err!=nil{return c.JSON(500,map[string]string{"error":err.Error()})};return c.JSON(200,rows)
