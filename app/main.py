@@ -216,6 +216,12 @@ def db() -> sqlite3.Connection:
       anime_id INTEGER PRIMARY KEY REFERENCES anime(id) ON DELETE CASCADE,
       status TEXT NOT NULL, message TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS manual_season_mappings (
+      anime_id INTEGER NOT NULL REFERENCES anime(id) ON DELETE CASCADE,
+      season INTEGER NOT NULL, anilist_id INTEGER NOT NULL,
+      expected_count INTEGER NOT NULL, metadata_title TEXT NOT NULL,
+      updated_at TEXT NOT NULL, PRIMARY KEY(anime_id, season)
+    );
     CREATE TABLE IF NOT EXISTS scan_history (
       id INTEGER PRIMARY KEY, kind TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
       status TEXT NOT NULL, message TEXT
@@ -1200,34 +1206,30 @@ def _refresh_anilist_expectations(limit: int = 3, force: bool = False, anime_id:
             if not root.get("episodes"):
                 raise RuntimeError("AniList entry has no episode count")
             chain, unambiguous = resolve_anilist_chain(root)
-            # AniList sequel entries can reveal seasons that are completely absent from Jellyfin.
-            # Map the chain in order, including those missing seasons, but never compress a season gap.
             highest_actual = max(actual_seasons or [1])
             seasons = list(range(1, max(highest_actual, len(chain)) + 1))
-            reason = ""
-            if not unambiguous:
-                reason = "Multiple possible sequel entries; manual review required"
-            elif highest_actual > len(chain):
-                reason = (f"Jellyfin has season {highest_actual}, but AniList only identifies "
-                          f"{len(chain)} linked TV entries; mapping needs review")
+            season_media = {n: media for n, media in zip(seasons, chain)}
             with DB_LOCK, closing(db()) as conn:
-                if reason:
-                    conn.execute("""INSERT INTO metadata_sync VALUES(?,?,?,?)
-                        ON CONFLICT(anime_id) DO UPDATE SET status=excluded.status,
-                        message=excluded.message,checked_at=excluded.checked_at""",
-                        (anime_id, "needs_review", reason, now()))
-                else:
-                    conn.execute("DELETE FROM expected_seasons WHERE anime_id=?", (anime_id,))
-                    for season_no, media in zip(seasons, chain):
-                        conn.execute("""INSERT INTO expected_seasons
-                            (anime_id,season,expected_count,anilist_id,metadata_title,updated_at)
-                            VALUES(?,?,?,?,?,?)""",
-                            (anime_id, season_no, int(media["episodes"]), int(media["id"]),
-                             next(iter(anilist_titles(media)), show["title"]), now()))
-                    conn.execute("""INSERT INTO metadata_sync VALUES(?,?,?,?)
-                        ON CONFLICT(anime_id) DO UPDATE SET status=excluded.status,
-                        message=excluded.message,checked_at=excluded.checked_at""",
-                        (anime_id, "matched", f"Matched {len(chain)} AniList season entr{'y' if len(chain)==1 else 'ies'}", now()))
+                overrides = conn.execute("SELECT season,anilist_id,expected_count,metadata_title FROM manual_season_mappings WHERE anime_id=?", (anime_id,)).fetchall()
+            for override in overrides:
+                season_media[int(override["season"])] = {"id": int(override["anilist_id"]), "episodes": int(override["expected_count"]), "title": {"userPreferred": override["metadata_title"]}}
+            missing = [n for n in range(1, highest_actual + 1) if n not in season_media]
+            reason = ("Manual mapping required for season(s): " + ", ".join(map(str, missing))) if missing else ""
+            if not unambiguous and not overrides and not reason:
+                reason = "Multiple possible sequel entries; manual review required"
+            with DB_LOCK, closing(db()) as conn:
+                conn.execute("DELETE FROM expected_seasons WHERE anime_id=?", (anime_id,))
+                for n, media in sorted(season_media.items()):
+                    if n not in seasons: continue
+                    td = media.get("title") or {}
+                    title = td.get("userPreferred") or td.get("english") or td.get("romaji") or td.get("native") or show["title"]
+                    conn.execute("""INSERT INTO expected_seasons (anime_id,season,expected_count,anilist_id,metadata_title,updated_at)
+                        VALUES(?,?,?,?,?,?)""", (anime_id,n,int(media["episodes"]),int(media["id"]),title,now()))
+                status = "needs_review" if reason else "matched"
+                message = reason or f"Matched {len(season_media)} AniList season entries"
+                conn.execute("""INSERT INTO metadata_sync VALUES(?,?,?,?)
+                    ON CONFLICT(anime_id) DO UPDATE SET status=excluded.status,message=excluded.message,checked_at=excluded.checked_at""",
+                    (anime_id,status,message,now()))
                 conn.commit()
             refreshed += 1
         except (AniListRateLimitError, AniListTemporaryError) as exc:
@@ -1742,6 +1744,56 @@ def metadata_select_save(anime_id: int, anilist_id: str = Form(...)) -> Redirect
     return RedirectResponse("/metadata", status_code=303)
 
 
+@app.get("/metadata/seasons/{anime_id}", response_class=HTMLResponse)
+def metadata_seasons_page(anime_id: int, season: int = 0, q: str = "") -> HTMLResponse:
+    with closing(db()) as conn:
+        show = conn.execute("SELECT id,title FROM anime WHERE id=?", (anime_id,)).fetchone()
+        actual = [int(x["season"] or 1) for x in conn.execute("SELECT DISTINCT season FROM episodes WHERE anime_id=?", (anime_id,)).fetchall()]
+        mappings = conn.execute("SELECT season,anilist_id,expected_count,metadata_title FROM manual_season_mappings WHERE anime_id=?", (anime_id,)).fetchall()
+    if not show: raise HTTPException(404, "Anime not found")
+    seasons = sorted({n for n in actual if n > 0}) or [1]
+    target = season if season in seasons else seasons[-1]
+    candidates, error = [], ""
+    if q.strip():
+        try:
+            for item in search_external_anime(q.strip()):
+                data=json.loads(item.get("metadata_json") or "{}")
+                item["anilist_id"]=str((item.get("provider_ids") or {}).get("AniList") or "")
+                item["episodes"]=data.get("episodes") or "—"
+                candidates.append(item)
+        except (requests.RequestException,RuntimeError,ValueError) as exc: error=str(exc)
+    body=template("""<div class="panel"><h2>Manual season mapping: {{show.title}}</h2><p class="muted">Manual assignments override automatic sequel detection and persist across refreshes.</p>
+    <table><tr><th>Season</th><th>AniList ID</th><th>Episodes</th><th>Title</th></tr>{% for n in seasons %}{% set m=mapped.get(n) %}<tr><td>{{n}}</td><td>{{m.anilist_id if m else "Not mapped"}}</td><td>{{m.expected_count if m else "—"}}</td><td>{{m.metadata_title if m else "—"}}</td></tr>{% endfor %}</table></div>
+    <div class="panel"><h2>Search AniList</h2><form method="get" action="/metadata/seasons/{{show.id}}"><select name="season">{% for n in seasons %}<option value="{{n}}" {% if n==target %}selected{% endif %}>Season {{n}}</option>{% endfor %}</select><input name="q" value="{{query}}" placeholder="Anime title"><button>Search</button></form>
+    {% if error %}<p>{{error}}</p>{% endif %}<table><tr><th>Title</th><th>Japanese</th><th>Year</th><th>Episodes</th><th>ID</th><th></th></tr>{% for item in candidates %}<tr><td>{{item.title}}</td><td>{{item.japanese_title}}</td><td>{{item.year}}</td><td>{{item.episodes}}</td><td>{{item.anilist_id}}</td><td><form method="post" action="/metadata/seasons/{{show.id}}"><input type="hidden" name="season" value="{{target}}"><input type="hidden" name="anilist_id" value="{{item.anilist_id}}"><button>Assign</button></form></td></tr>{% else %}<tr><td colspan="6">No results. Search AniList above.</td></tr>{% endfor %}</table></div>
+    <div class="panel"><h2>Enter AniList ID manually</h2><form method="post" action="/metadata/seasons/{{show.id}}"><select name="season">{% for n in seasons %}<option value="{{n}}" {% if n==target %}selected{% endif %}>Season {{n}}</option>{% endfor %}</select><input name="anilist_id" type="number" min="1" placeholder="AniList ID" required><button>Save mapping</button></form><p><a href="/metadata">Back to Metadata</a></p></div>""").render(show=show,seasons=seasons,mapped={int(m["season"]):m for m in mappings},target=target,query=q,candidates=candidates,error=error)
+    return page(body)
+
+
+@app.post("/metadata/seasons/{anime_id}")
+def metadata_seasons_save(anime_id: int, season: int = Form(...), anilist_id: str = Form(...)) -> RedirectResponse:
+    value=anilist_id.strip()
+    if season<1 or not value.isdigit() or int(value)<1: raise HTTPException(400,"Season and AniList ID must be positive integers")
+    try: media=anilist_media(int(value))
+    except (AniListRateLimitError,AniListTemporaryError,requests.RequestException,RuntimeError) as exc: raise HTTPException(502,f"Could not verify AniList ID: {exc}") from exc
+    if not media or not media.get("episodes"): raise HTTPException(404,"AniList ID did not return an anime with an episode count")
+    td=media.get("title") or {}
+    title=td.get("userPreferred") or td.get("english") or td.get("romaji") or td.get("native") or f"AniList {value}"
+    with DB_LOCK, closing(db()) as conn:
+        if not conn.execute("SELECT 1 FROM anime WHERE id=?",(anime_id,)).fetchone(): raise HTTPException(404,"Anime not found")
+        if not conn.execute("SELECT 1 FROM episodes WHERE anime_id=? AND COALESCE(season,1)=?",(anime_id,season)).fetchone(): raise HTTPException(400,"That season does not exist in Jellyfin episode data")
+        conn.execute("""INSERT INTO manual_season_mappings (anime_id,season,anilist_id,expected_count,metadata_title,updated_at)
+            VALUES(?,?,?,?,?,?) ON CONFLICT(anime_id,season) DO UPDATE SET anilist_id=excluded.anilist_id,expected_count=excluded.expected_count,metadata_title=excluded.metadata_title,updated_at=excluded.updated_at""",
+            (anime_id,season,int(value),int(media["episodes"]),title,now()))
+        conn.execute("""INSERT INTO expected_seasons (anime_id,season,expected_count,anilist_id,metadata_title,updated_at)
+            VALUES(?,?,?,?,?,?) ON CONFLICT(anime_id,season) DO UPDATE SET expected_count=excluded.expected_count,anilist_id=excluded.anilist_id,metadata_title=excluded.metadata_title,updated_at=excluded.updated_at""",
+            (anime_id,season,int(media["episodes"]),int(value),title,now()))
+        conn.execute("""INSERT INTO metadata_sync VALUES(?,?,?,?) ON CONFLICT(anime_id) DO UPDATE SET status='needs_review',message='Manual season mapping saved',checked_at=excluded.checked_at""",
+            (anime_id,"needs_review","Manual season mapping saved",now()))
+        conn.commit()
+    return RedirectResponse("/metadata",status_code=303)
+
+
 @app.get("/metadata", response_class=HTMLResponse)
 def metadata_page() -> HTMLResponse:
     with closing(db()) as conn:
@@ -1770,7 +1822,7 @@ def metadata_page() -> HTMLResponse:
         <form method="post" action="/metadata/refresh"><button>Refresh AniList matches</button></form></div>
         <p class="muted">Expected counts come from AniList. Actual episodes are read from Jellyfin and checked against files. Ambiguous mappings are not guessed.</p>
         <table><tr><th>Anime</th><th>Season</th><th>Expected</th><th>Present</th><th>Missing episode numbers</th><th>Status</th></tr>
-        {% for r in rows %}<tr><td>{{r.title}}<br><form class="inline" method="get" action="/metadata/select/{{r.anime_id}}"><button type="submit">Select AniList</button></form></td><td>{{r.season}}</td><td>{{r.expected}}</td><td>{{r.actual}}</td><td>{{r.missing}}</td><td>{{r.status}}<br><span class="muted">{{r.message}}</span></td></tr>
+        {% for r in rows %}<tr><td>{{r.title}}<br><form class="inline" method="get" action="/metadata/select/{{r.anime_id}}"><button type="submit">Select AniList</button></form> <form class="inline" method="get" action="/metadata/seasons/{{r.anime_id}}"><button type="submit">Fix seasons</button></form></td><td>{{r.season}}</td><td>{{r.expected}}</td><td>{{r.actual}}</td><td>{{r.missing}}</td><td>{{r.status}}<br><span class="muted">{{r.message}}</span></td></tr>
         {% else %}<tr><td colspan="6">No tracked anime.</td></tr>{% endfor %}</table></div>""").render(rows=rows)
     return page(body)
 
