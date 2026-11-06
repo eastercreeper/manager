@@ -1,10 +1,19 @@
-# Single standalone Anime Manager image. Seanime is the embedded Go application
-# foundation; no second Seanime service is launched.
-FROM golang:1.27.1-bookworm AS build
+# Build Seanime's existing React frontend first, then embed it into one Go binary.
+FROM node:22-bookworm-slim AS web-build
+WORKDIR /src/seanime-web
+COPY seanime-web/package.json seanime-web/package-lock.json ./
+RUN npm ci
+COPY seanime-web/ ./
+RUN npm run build
+WORKDIR /src
+RUN mkdir -p web && cp -a /src/seanime-web/out/. /src/web/
+
+FROM golang:1.27.1-bookworm AS go-build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
+COPY --from=web-build /src/web ./web
 RUN CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o /out/anime-manager .
 
 FROM debian:bookworm-slim
@@ -17,7 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && useradd --uid 10001 --gid appgroup --create-home --shell /usr/sbin/nologin appuser \
     && mkdir -p /data && chown -R appuser:appgroup /data
 WORKDIR /app
-COPY --from=build /out/anime-manager /app/anime-manager
+COPY --from=go-build /out/anime-manager /app/anime-manager
 USER appuser
 VOLUME ["/data"]
 EXPOSE 8787
