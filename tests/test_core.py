@@ -1,5 +1,7 @@
 from pathlib import Path
 import asyncio
+import re
+import subprocess
 
 import pytest
 
@@ -370,6 +372,41 @@ def test_authentication_and_csrf_helpers(monkeypatch):
         main.require_csrf(request, "bad")
 
 
+def test_rendered_forms_preserve_attributes_and_include_csrf(monkeypatch):
+    monkeypatch.setattr(main, "ADMIN_PASSWORD", "test-password")
+    response = main.page('<form method="post" action="/upload" enctype="multipart/form-data"><input name="file"></form>')
+    html = response.body.decode()
+    assert '<form method="post" action="/upload" enctype="multipart/form-data">' in html
+    assert re.search(r'<input type="hidden" name="csrf_token" value="[^"]+">', html)
+    assert main.CSRF_COOKIE in response.headers.get("set-cookie", "")
+
+
+def test_login_post_requires_csrf_but_valid_token_passes_middleware(monkeypatch):
+    monkeypatch.setattr(main, "ADMIN_PASSWORD", "test-password")
+
+    def request(body, cookie):
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+        return __import__("starlette.requests", fromlist=["Request"]).Request({
+            "type": "http", "method": "POST", "path": "/login", "headers": [
+                (b"cookie", cookie.encode())
+            ], "query_string": b"", "scheme": "http", "client": ("test", 1),
+            "server": ("test", 80), "root_path": "",
+        }, receive=receive)
+
+    async def next_response(request):
+        return main.HTMLResponse("ok")
+
+    token = "csrf-token"
+    blocked = asyncio.run(main.security_middleware(
+        request(b"password=test-password", f"{main.CSRF_COOKIE}={token}"), next_response))
+    assert blocked.status_code == 403
+    allowed = asyncio.run(main.security_middleware(
+        request(f"password=test-password&csrf_token={token}".encode(), f"{main.CSRF_COOKIE}={token}"),
+        next_response))
+    assert allowed.status_code == 200
+
+
 def test_http_security_middleware_blocks_anonymous_and_csrfless_requests(monkeypatch):
     monkeypatch.setattr(main, "ADMIN_PASSWORD", "test-password")
 
@@ -395,6 +432,79 @@ def test_http_security_middleware_blocks_anonymous_and_csrfless_requests(monkeyp
         next_response,
     ))
     assert blocked.status_code == 403
+
+
+def test_qbittorrent_uses_configured_save_path(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "QBT_SAVE_PATH", tmp_path / "anime")
+    monkeypatch.setenv("QBITTORRENT_USERNAME", "user")
+    monkeypatch.setenv("QBITTORRENT_PASSWORD", "pass")
+    captured = {}
+
+    class Response:
+        status_code = 200
+        text = "Ok."
+
+    class Session:
+        def post(self, url, **kwargs):
+            captured.update(kwargs["data"])
+            return Response()
+
+    client = main.QBitClient()
+    monkeypatch.setattr(client, "session", lambda: Session())
+    client.add("magnet:?xt=urn:btih:" + "a" * 40)
+    assert captured["savepath"] == str(tmp_path / "anime")
+
+
+def test_ffprobe_failure_needs_review(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "db.sqlite3"))
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    download_root = tmp_path / "download"
+    download_root.mkdir()
+    source = download_root / "Anime - S01E01.mkv"
+    source.write_bytes(b"not media")
+    with main.db() as conn:
+        anime_id = conn.execute(
+            "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("Anime", "Anime", "Anime", main.now(), main.now()),
+        ).lastrowid
+        release_id = conn.execute(
+            "INSERT INTO releases(anime_id,source,source_id,title,page_url,created_at) VALUES(?,?,?,?,?,?)",
+            (anime_id, "Nyaa", "release", "Anime", "https://example.test", main.now()),
+        ).lastrowid
+        conn.execute("INSERT INTO downloads(release_id,state,save_path,content_path) VALUES(?,?,?,?)",
+                     (release_id, "completed", str(download_root), str(source)))
+        conn.commit()
+    monkeypatch.setattr(main, "inspect_media", lambda path: (_ for _ in ()).throw(
+        subprocess.CalledProcessError(1, "ffprobe")))
+    assert main.import_completed() == 0
+    with main.db() as conn:
+        row = conn.execute("SELECT state FROM downloads").fetchone()
+    assert row["state"] == "needs_review"
+
+
+def test_custom_folder_survives_jellyfin_sync(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "db.sqlite3"))
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    with main.db() as conn:
+        conn.execute(
+            "INSERT INTO anime(title,folder_name,folder_locked,search_query,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+            ("Official Title", "Custom Folder", 1, "Official Title", main.now(), main.now()),
+        )
+        conn.commit()
+
+    class FakeJellyfin:
+        def series(self):
+            return [{"Id": "series-1", "Name": "Official Title", "Path": "/ivan/Shows/Official Title"}]
+
+        def episodes(self, series_id):
+            return []
+
+    monkeypatch.setattr(main, "JellyfinClient", FakeJellyfin)
+    assert main.sync_jellyfin() == 1
+    with main.db() as conn:
+        row = conn.execute("SELECT folder_name,jellyfin_id FROM anime").fetchone()
+    assert row["folder_name"] == "Custom Folder"
+    assert row["jellyfin_id"] == "series-1"
 
 
 def test_release_search_persists_candidates_for_selected_anime(tmp_path, monkeypatch):

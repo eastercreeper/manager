@@ -6,7 +6,6 @@ import sqlite3
 import subprocess
 import threading
 import urllib.parse
-import base64
 import hashlib
 import hmac
 import secrets
@@ -30,6 +29,7 @@ NYAA_BASE = os.getenv("NYAA_BASE", "https://nyaa.si/").rstrip("/") + "/"
 TSUKIHIME_BASE = os.getenv("TSUKIHIME_BASE", "https://api.tsukihime.org/v1").rstrip("/")
 QBT_URL = os.getenv("QBITTORRENT_URL", "http://127.0.0.1:30024").rstrip("/")
 QBT_CATEGORY = os.getenv("QBITTORRENT_CATEGORY", "anime")
+QBT_SAVE_PATH = Path(os.getenv("QBITTORRENT_SAVE_PATH", "/downloads/anime"))
 SCAN_INTERVAL_MINUTES = max(5, int(os.getenv("SCAN_INTERVAL_MINUTES", "30")))
 JELLYFIN_URL = os.getenv("JELLYFIN_URL", "").rstrip("/")
 JELLYFIN_API_KEY = os.getenv("JELLYFIN_API_KEY", "")
@@ -39,6 +39,7 @@ JELLYFIN_PATH_PREFIXES = [p for p in os.getenv(
 ).split(",") if "=" in p]
 SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+SECURE_COOKIES = os.getenv("SECURE_COOKIES", "").lower() in {"1", "true", "yes"}
 SESSION_COOKIE = "anime_manager_session"
 CSRF_COOKIE = "anime_manager_csrf"
 DB_LOCK = threading.Lock()
@@ -84,12 +85,12 @@ def require_csrf(request: Optional[Request], token: str = "") -> None:
 
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
-    if ADMIN_PASSWORD and request.url.path not in {"/login", "/health"}:
-        if not valid_session(request.cookies.get(SESSION_COOKIE, "")):
+    if ADMIN_PASSWORD:
+        if request.url.path not in {"/login", "/health"} and not valid_session(request.cookies.get(SESSION_COOKIE, "")):
             if request.method == "GET":
                 return RedirectResponse("/login", status_code=303)
             return HTMLResponse("Authentication required", status_code=401)
-        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+        if request.method in {"POST", "PUT", "PATCH", "DELETE"} and request.url.path != "/health":
             expected = request.cookies.get(CSRF_COOKIE, "")
             body = await request.body()
             encoded = urllib.parse.urlencode({"csrf_token": expected}).encode()
@@ -98,8 +99,37 @@ async def security_middleware(request: Request, call_next):
             request._body = body
     response = await call_next(request)
     if ADMIN_PASSWORD and not request.cookies.get(CSRF_COOKIE):
-        response.set_cookie(CSRF_COOKIE, secrets.token_urlsafe(32), httponly=False, samesite="strict", secure=False)
+        response.set_cookie(CSRF_COOKIE, secrets.token_urlsafe(32), httponly=False, samesite="strict", secure=SECURE_COOKIES)
     return response
+
+
+def path_is_within(root: Path, candidate: Path) -> bool:
+    try:
+        root = root.resolve()
+        candidate = candidate.resolve()
+        return candidate == root or root in candidate.parents
+    except OSError:
+        return False
+
+
+def ensure_runtime_paths() -> None:
+    paths = (DATA_DIR, QBT_SAVE_PATH)
+    for path in paths:
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".anime-manager-write-test"
+            probe.touch(exist_ok=False)
+            probe.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Anime Manager cannot write to {path}; configure TrueNAS ACLs or APP_UID/APP_GID. "
+                f"Refusing to run with elevated privileges: {exc}"
+            ) from exc
+    if LIBRARY_DIR.exists() and not os.access(LIBRARY_DIR, os.W_OK):
+        raise RuntimeError(
+            f"Anime Manager cannot write to {LIBRARY_DIR}; configure TrueNAS ACLs or APP_UID/APP_GID. "
+            "Refusing to run with elevated privileges."
+        )
 
 
 def now() -> str:
@@ -118,7 +148,7 @@ def db() -> sqlite3.Connection:
       id INTEGER PRIMARY KEY, title TEXT NOT NULL, folder_name TEXT NOT NULL,
       search_query TEXT NOT NULL, jellyfin_id TEXT UNIQUE, status TEXT NOT NULL DEFAULT 'tracking',
       year INTEGER, poster_url TEXT, metadata_json TEXT NOT NULL DEFAULT '{}',
-      created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL, folder_locked BOOLEAN NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS alternate_titles (
       id INTEGER PRIMARY KEY, anime_id INTEGER NOT NULL REFERENCES anime(id) ON DELETE CASCADE,
@@ -182,6 +212,9 @@ def db() -> sqlite3.Connection:
     ):
         if name not in download_columns:
             conn.execute(f"ALTER TABLE downloads ADD COLUMN {name} {definition}")
+    anime_columns = {row["name"] for row in conn.execute("PRAGMA table_info(anime)")}
+    if "folder_locked" not in anime_columns:
+        conn.execute("ALTER TABLE anime ADD COLUMN folder_locked BOOLEAN NOT NULL DEFAULT 0")
     conn.commit()
     return conn
 
@@ -323,13 +356,13 @@ class QBitClient:
             raise RuntimeError("qBittorrent login failed")
         return sess
 
-    def add(self, torrent_url: str, save_path: str = str(DOWNLOAD_DIR)) -> None:
+    def add(self, torrent_url: str, save_path: Optional[str] = None) -> None:
         scheme = urllib.parse.urlparse(torrent_url).scheme.lower()
         if scheme not in {"magnet", "http", "https"}:
             raise RuntimeError("Unsupported torrent URL")
         sess = self.session()
         response = sess.post(self.url + "/api/v2/torrents/add",
-                             data={"urls": torrent_url, "savepath": save_path,
+                             data={"urls": torrent_url, "savepath": save_path or str(QBT_SAVE_PATH),
                                    "category": QBT_CATEGORY, "paused": "false"},
                              headers={"Referer": self.url}, timeout=30)
         if response.status_code != 200 or response.text.strip() != "Ok.":
@@ -366,34 +399,53 @@ def inspect_media(path: Path) -> dict:
     audio = [s for s in streams if s.get("codec_type") == "audio"]
     subtitles = [s for s in streams if s.get("codec_type") == "subtitle"]
     acceptable = {"ass", "ssa", "ass/ssa"}
-    english = any((s.get("tags", {}).get("language", "").lower() in {"en", "eng", "english"} and
-                   s.get("codec_name", "").lower() in acceptable) for s in subtitles)
-    japanese = any((s.get("tags", {}).get("language", "").lower() in {"ja", "jpn", "japanese"} and
-                    s.get("codec_name", "").lower() in acceptable) for s in subtitles)
+
+    def language(stream: dict) -> str:
+        tags = stream.get("tags", {})
+        values = [str(tags.get(key, "")) for key in ("language", "title")]
+        tokens = {token for value in values for token in re.split(r"[^a-z]+", value.lower()) if token}
+        if tokens & {"en", "eng", "english"}:
+            return "eng"
+        if tokens & {"ja", "jpn", "japanese"}:
+            return "jpn"
+        return ""
+
+    english = any(language(s) == "eng" and s.get("codec_name", "").lower() in acceptable for s in subtitles)
+    japanese = any(language(s) == "jpn" and s.get("codec_name", "").lower() in acceptable for s in subtitles)
     external = []
     for candidate in path.parent.glob(path.stem + ".*"):
         if candidate.suffix.lower() not in {".ass", ".ssa", ".srt"}:
             continue
-        language = candidate.stem.lower()
+        language_tokens = {token for token in re.split(r"[^a-z]+", candidate.stem.lower()) if token}
         external.append({"path": str(candidate), "codec_name": candidate.suffix[1:].lower(),
-                         "tags": {"language": "jpn" if any(x in language for x in ("jpn", "ja", "japanese"))
-                                  else "eng" if any(x in language for x in ("eng", "en", "english")) else ""}})
+                         "tags": {"language": "jpn" if language_tokens & {"jpn", "ja", "japanese"}
+                                  else "eng" if language_tokens & {"eng", "en", "english"} else ""}})
     subtitles.extend(external)
     english = english or any(
-        s["tags"]["language"] in {"en", "eng", "english"} and s["codec_name"] in acceptable
+        s["tags"]["language"] == "eng" and s["codec_name"] in acceptable
         for s in external
     )
     japanese = japanese or any(
-        s["tags"]["language"] in {"ja", "jpn", "japanese"} and s["codec_name"] in acceptable
+        s["tags"]["language"] == "jpn" and s["codec_name"] in acceptable
         for s in external
     )
-    return {"audio": audio, "subtitles": subtitles, "english_ass": english, "japanese_ass": japanese}
+    audio_languages = [language(stream) for stream in audio]
+    return {
+        "audio": audio, "subtitles": subtitles, "english_ass": english, "japanese_ass": japanese,
+        "audio_languages": audio_languages, "japanese_audio": "jpn" in audio_languages,
+        "multiple_audio": len(audio) > 1,
+    }
 
 
 def parse_file_episodes(path: Path) -> tuple[int, list[int]]:
     stem = path.stem
     season_match = re.search(r"(?:^|[^a-z])s(\d{1,2})(?=e|[^a-z]|$)", stem, re.IGNORECASE)
     season = int(season_match.group(1)) if season_match else 1
+    cross_match = re.search(r"\b(\d{1,2})x(\d{1,3})(?:[-&](?:\d{1,2}x)?(\d{1,3}))?\b", stem, re.IGNORECASE)
+    if cross_match:
+        start = int(cross_match.group(2))
+        end = int(cross_match.group(3) or start)
+        return int(cross_match.group(1)), list(range(start, end + 1))
     range_match = re.search(r"\b(?:s\d{1,2}\s*)?e(\d{1,3})(?:[-&]e?(\d{1,3})|e(\d{1,3}))?\b", stem, re.IGNORECASE)
     if range_match:
         start = int(range_match.group(1))
@@ -636,9 +688,11 @@ def sync_jellyfin() -> int:
                 ).fetchone()
             if row:
                 anime_id = row["id"]
+                current = conn.execute("SELECT folder_locked,folder_name FROM anime WHERE id=?", (anime_id,)).fetchone()
+                next_folder = current["folder_name"] if current["folder_locked"] else folder
                 conn.execute("""UPDATE anime SET title=?, folder_name=?, search_query=?, jellyfin_id=?,
                     year=?, metadata_json=?, updated_at=? WHERE id=?""",
-                             (title, folder, title, item.get("Id"),
+                             (title, next_folder, title, item.get("Id"),
                               (item.get("PremiereDate") or "")[:4] or None,
                               json.dumps(item), now(), anime_id))
             else:
@@ -737,16 +791,25 @@ def import_completed() -> int:
             imported_files_for_download = 0
             verification_failed = False
             for source in files:
+                if not path_is_within(download_root, source):
+                    verification_failed = True
+                    conn.execute("UPDATE downloads SET state='needs_review',error=? WHERE id=?",
+                                 ("Torrent content escapes the configured download directory", download["id"]))
+                    continue
                 season, episode_numbers = parse_file_episodes(source)
                 if not episode_numbers:
+                    verification_failed = True
                     conn.execute("UPDATE downloads SET state='needs_review',error=? WHERE id=?",
                                  ("Could not identify season/episode from media filename", download["id"]))
                     continue
                 try:
                     media = inspect_media(source)
                 except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                    verification_failed = True
                     conn.execute("INSERT INTO media_verifications(download_id,file_path,audio_json,subtitle_json,error,verified_at) VALUES(?,?,?,?,?,?)",
                                  (download["id"], str(source), "[]", "[]", str(exc), now()))
+                    conn.execute("UPDATE downloads SET state='needs_review',error=? WHERE id=?",
+                                 (f"Media verification failed: {exc}", download["id"]))
                     continue
                 accepted = bool(media["english_ass"])
                 verification = conn.execute("""INSERT INTO media_verifications(download_id,file_path,audio_json,subtitle_json,english_ass,japanese_ass,accepted,verified_at)
@@ -797,6 +860,9 @@ def import_completed() -> int:
             elif files and not verification_failed and not conn.execute("SELECT 1 FROM imported_files WHERE anime_id=? AND source_path IN ({})".format(
                     ",".join("?" for _ in files)), (download["anime_id"], *[str(p) for p in files])).fetchone():
                 conn.execute("UPDATE downloads SET state='already_imported' WHERE id=?", (download["id"],))
+            elif not files:
+                conn.execute("UPDATE downloads SET state='needs_review',error=? WHERE id=?",
+                             ("No media files were found in the torrent content path", download["id"]))
         conn.commit()
     if imported:
         try:
@@ -847,7 +913,7 @@ def monitor_downloads() -> None:
             if not content_path and torrent.get("hash") and hasattr(client, "torrent_properties"):
                 try:
                     properties = client.torrent_properties(str(torrent["hash"]))
-                    save_path = properties.get("save_path") or torrent.get("save_path")
+                    save_path = properties.get("save_path") or torrent.get("save_path") or str(QBT_SAVE_PATH)
                     if save_path and torrent.get("name"):
                         candidate = Path(save_path) / str(torrent["name"])
                         content_path = str(candidate) if candidate.exists() else None
@@ -857,7 +923,8 @@ def monitor_downloads() -> None:
             conn.execute("""UPDATE downloads SET torrent_hash=?,progress=?,state=?,name=?,save_path=?,content_path=?,last_checked=?,
                 completed_at=CASE WHEN ?='completed' THEN COALESCE(completed_at,?) ELSE completed_at END WHERE id=?""",
                          (str(torrent.get("hash", "")) or row["torrent_hash"], float(torrent.get("progress", 0)),
-                          state, torrent.get("name"), torrent.get("save_path"), content_path, now(), state, now(), row["id"]))
+                          state, torrent.get("name"), torrent.get("save_path") or str(QBT_SAVE_PATH),
+                          content_path, now(), state, now(), row["id"]))
         conn.commit()
     import_completed()
 
@@ -876,10 +943,15 @@ nav a{margin-right:15px} .stat{font-size:24px;font-weight:700}
 
 def page(body: str, message: str = "") -> HTMLResponse:
     token = secrets.token_urlsafe(32)
-    body = body.replace("<form", f'<form><input type="hidden" name="csrf_token" value="{token}">')
+    body = re.sub(
+        r"<form(\s[^>]*)?>",
+        lambda match: f"<form{match.group(1) or ''}><input type=\"hidden\" name=\"csrf_token\" value=\"{token}\">",
+        body,
+        flags=re.IGNORECASE,
+    )
     response = HTMLResponse(PAGE.render(body=body, message=message))
     if ADMIN_PASSWORD:
-        response.set_cookie(CSRF_COOKIE, token, httponly=False, samesite="strict", secure=False)
+        response.set_cookie(CSRF_COOKIE, token, httponly=False, samesite="strict", secure=SECURE_COOKIES)
     return response
 
 
@@ -897,14 +969,16 @@ def login(password: str = Form(...)) -> RedirectResponse:
     if not ADMIN_PASSWORD or not hmac.compare_digest(password, ADMIN_PASSWORD):
         return RedirectResponse("/login?error=Invalid%20credentials", status_code=303)
     response = RedirectResponse("/", status_code=303)
-    response.set_cookie(SESSION_COOKIE, session_cookie(), httponly=True, samesite="strict", secure=False, max_age=86400)
-    response.set_cookie(CSRF_COOKIE, secrets.token_urlsafe(32), httponly=False, samesite="strict", secure=False)
+    response.set_cookie(SESSION_COOKIE, session_cookie(), httponly=True, samesite="strict", secure=SECURE_COOKIES, max_age=86400)
+    response.set_cookie(CSRF_COOKIE, secrets.token_urlsafe(32), httponly=False, samesite="strict", secure=SECURE_COOKIES)
     return response
 
 
 @app.on_event("startup")
 def start_scheduler() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if ADMIN_PASSWORD and len(SESSION_SECRET) < 32:
+        raise RuntimeError("SESSION_SECRET must be at least 32 characters when authentication is enabled")
+    ensure_runtime_paths()
     db().close()
     scheduler.add_job(background_sync, "interval", minutes=SCAN_INTERVAL_MINUTES, id="sync", replace_existing=True, max_instances=1)
     scheduler.add_job(monitor_downloads, "interval", minutes=2, id="downloads", replace_existing=True, max_instances=1)
@@ -944,11 +1018,41 @@ def library() -> HTMLResponse:
 
 
 @app.post("/anime")
-def add_anime(title: str = Form(...), folder_name: str = Form("")) -> RedirectResponse:
+def add_anime(title: str = Form(...), folder_name: str = Form(""),
+              metadata_json: str = Form("{}"), provider_ids: str = Form("{}"),
+              alternate_titles: str = Form(""), jellyfin_id: str = Form(""),
+              year: str = Form("")) -> RedirectResponse:
     title, folder_name = title.strip(), safe_folder(folder_name.strip() or title)
     with closing(db()) as conn:
-        conn.execute("INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
-                     (title, folder_name, title, now(), now()))
+        try:
+            metadata = json.loads(metadata_json or "{}")
+            providers = json.loads(provider_ids or "{}")
+        except ValueError as exc:
+            raise HTTPException(400, "Invalid anime metadata") from exc
+        existing = conn.execute(
+            "SELECT id FROM anime WHERE lower(title)=lower(?) OR lower(folder_name)=lower(?)",
+            (title, folder_name),
+        ).fetchone()
+        if not existing and providers:
+            placeholders = ",".join("?" for _ in providers)
+            existing = conn.execute(
+                f"""SELECT DISTINCT a.id FROM anime a JOIN provider_ids p ON p.anime_id=a.id
+                    WHERE p.provider IN ({placeholders}) AND p.value IN ({placeholders}) LIMIT 1""",
+                (*providers.keys(), *providers.values()),
+            ).fetchone()
+        if not existing:
+            conn.execute("""INSERT INTO anime(title,folder_name,search_query,created_at,updated_at,folder_locked)
+                VALUES(?,?,?,?,?,1)""", (title, folder_name, title, now(), now()))
+            anime_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute("UPDATE anime SET jellyfin_id=?,year=?,metadata_json=? WHERE id=?",
+                         (jellyfin_id or None, int(year) if year.isdigit() else None,
+                          json.dumps(metadata), anime_id))
+            for provider, value in providers.items():
+                conn.execute("INSERT OR IGNORE INTO provider_ids(anime_id,provider,value) VALUES(?,?,?)",
+                             (anime_id, str(provider), str(value)))
+            for alternate in [value.strip() for value in alternate_titles.split("\n") if value.strip()]:
+                conn.execute("INSERT OR IGNORE INTO alternate_titles(anime_id,title) VALUES(?,?)",
+                             (anime_id, alternate))
         conn.commit()
     return RedirectResponse("/library", status_code=303)
 
@@ -975,7 +1079,7 @@ def search_page(q: str = "", release_q: str = "", anime_id: int = 0) -> HTMLResp
             releases = []
     body = template("""<div class="panel"><h2>Search anime</h2>
     <form method="get"><input name="q" value="{{q}}" placeholder="Japanese, English, or alternate title" size="45"><button>Search metadata</button></form>
-    <table><tr><th>Title</th><th>Year</th><th>Provider IDs</th><th>Action</th></tr>{% for item in anime_results %}<tr><td>{{item.title}}{% if item.folder_name and item.folder_name != item.title %}<br><span class="muted">{{item.folder_name}}</span>{% endif %}</td><td>{{item.year or ''}}</td><td>{{item.provider_ids or ''}}</td><td><form method="post" action="/anime"><input type="hidden" name="title" value="{{item.title}}"><input name="folder_name" placeholder="Custom folder name"><button>Track anime</button></form></td></tr>{% else %}<tr><td colspan="4">No metadata matches.</td></tr>{% endfor %}</table></div>
+    <table><tr><th>Title</th><th>Year</th><th>Provider IDs</th><th>Action</th></tr>{% for item in anime_results %}<tr><td>{{item.title}}{% if item.folder_name and item.folder_name != item.title %}<br><span class="muted">{{item.folder_name}}</span>{% endif %}</td><td>{{item.year or ''}}</td><td>{{item.provider_ids or ''}}</td><td><form method="post" action="/anime"><input type="hidden" name="title" value="{{item.title}}"><input type="hidden" name="metadata_json" value="{{item.metadata_json or '{}'}}"><input type="hidden" name="provider_ids" value="{{item.provider_ids or '{}'}}"><input type="hidden" name="jellyfin_id" value="{{item.jellyfin_id or ''}}"><input type="hidden" name="year" value="{{item.year or ''}}"><input name="folder_name" placeholder="Custom folder name"><button>Track anime</button></form></td></tr>{% else %}<tr><td colspan="4">No metadata matches.</td></tr>{% endfor %}</table></div>
     <div class="panel"><h2>Search releases</h2><form method="get"><input name="release_q" value="{{release_q}}" placeholder="Title or identifier" size="45"><select name="anime_id" required><option value="">Track releases for...</option>{% for anime in tracked %}<option value="{{anime.id}}" {% if anime.id == anime_id %}selected{% endif %}>{{anime.title}}</option>{% endfor %}</select><button>Search Nyaa and TsukiHime</button></form>
     <table><tr><th>Release</th><th>Source</th><th>Quality</th><th>Audio/subtitles</th><th>Seeders</th><th>Score</th><th>Action</th></tr>{% for r in releases %}<tr><td><a href="/releases/{{r.id}}">{{r.title}}</a></td><td>{{r.source}}</td><td>{{r.quality}}</td><td>{{r.audio_hint}} / {{r.subtitle_hint}}</td><td>{{r.seeders}}</td><td>{{"%.1f"|format(r.score)}}<br><span class="muted">{{r.score_reason}}</span></td><td><form class="inline" method="post" action="/releases/{{r.id}}/approve"><button>Approve</button></form><form class="inline" method="post" action="/releases/{{r.id}}/reject"><button class="danger">Reject</button></form></td></tr>{% else %}<tr><td colspan="7">No release matches.</td></tr>{% endfor %}</table></div>""").render(
         q=q, release_q=release_q, anime_id=anime_id, tracked=tracked, anime_results=anime_results, releases=releases)
@@ -1061,7 +1165,8 @@ def save_settings(jellyfin_url: str = Form(""), jellyfin_api_key: str = Form("")
 @app.post("/releases/{release_id}/approve")
 def approve(release_id: int) -> RedirectResponse:
     client = QBitClient()
-    save_path = configured_path("download_dir", DOWNLOAD_DIR)
+    save_path = QBT_SAVE_PATH
+    save_path.mkdir(parents=True, exist_ok=True)
     with DB_LOCK, closing(db()) as conn:
         release = conn.execute("SELECT r.*,d.id download_id FROM releases r LEFT JOIN downloads d ON d.release_id=r.id WHERE r.id=?", (release_id,)).fetchone()
         if not release:

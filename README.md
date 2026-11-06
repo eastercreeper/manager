@@ -28,9 +28,12 @@ Anime Manager is a self-hosted FastAPI application for tracking anime in Jellyfi
    - Jellyfin Shows -> `/ivan/Shows`
    - qBittorrent downloads -> `/downloads`
 4. Set `JELLYFIN_URL`, `JELLYFIN_API_KEY`, `QBITTORRENT_USERNAME`, and `QBITTORRENT_PASSWORD` in the Compose environment/secrets configuration. An `.env` file is not required.
+   Set `ADMIN_PASSWORD` and a random `SESSION_SECRET` of at least 32 characters for authentication. Set `SECURE_COOKIES=true` when HTTPS terminates in front of the service.
 5. Start the stack and open `http://<TRUENAS-LAN-IP>:8787`.
 
-The Compose service uses the named volume `anime_manager_data` at `/data`; Docker creates it automatically. `/downloads` and `/ivan/Shows` are the existing host mounts. The image includes `ffprobe`, runs as an unprivileged user, listens on `0.0.0.0:8787`, and uses `tini` for graceful shutdown.
+The Compose service uses the named volume `anime_manager_data` at `/data`; Docker creates it automatically. `/downloads` and `/ivan/Shows` are the existing host mounts. qBittorrent saves approved torrents under `/downloads/anime` (`QBITTORRENT_SAVE_PATH`). The image includes `ffprobe`, runs as an unprivileged user, listens on `0.0.0.0:8787`, and uses `tini` for graceful shutdown.
+
+Set `APP_UID` and `APP_GID` to an identity granted write access by the TrueNAS ACLs on `/data`, `/downloads/anime`, and `/ivan/Shows`. The container does not fall back to root; startup fails with the affected path if permissions are insufficient. Docker creates the internal application directories automatically.
 
 ## Path mapping
 
@@ -48,6 +51,7 @@ Jellyfin may report `/ivan/Shows` or `/mnt/Jellyfin/JellyfinData/JP-BEAN/Shows`.
 - The published TsukiHime host was DNS-unavailable during this audit, so live connectivity could not be verified here. The adapter is schema-driven and covered by mocked OpenAPI/API tests; it does not invent a fixed search endpoint.
 - TsukiHime is isolated behind its adapter and fails closed if its published OpenAPI schema has no compatible search/release endpoint.
 - Restrict the dashboard to a trusted network or place it behind an authenticated reverse proxy.
+- With authentication enabled, all browser state-changing requests require the rendered double-submit CSRF token; login itself is also CSRF-protected.
 
 ## Development
 
@@ -58,3 +62,5 @@ pip install -r requirements.txt
 pytest -q
 uvicorn app.main:app --host 0.0.0.0 --port 8787
 ```
+
+The current regression suite covers Jellyfin discovery/path mapping, metadata and custom-folder preservation, Nyaa/TsukiHime normalization, qBittorrent reconciliation and save paths, CSRF/authentication, episode parsing, path isolation, subtitle verification, and multi-anime importing.

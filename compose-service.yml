@@ -3,7 +3,12 @@
 services:
   anime-manager:
     container_name: anime-manager
-    build: /mnt/.ix-apps/app_mounts/anime-manager
+    # Set APP_UID/APP_GID to an ACL-compatible dataset identity; the image never falls back to root.
+    build:
+      context: /mnt/.ix-apps/app_mounts/anime-manager
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
     depends_on:
       - tailscale
     network_mode: service:tailscale
@@ -14,6 +19,7 @@ services:
       - DATA_DIR=/data
       - LIBRARY_DIR=/ivan/Shows
       - DOWNLOAD_DIR=/downloads
+      - QBITTORRENT_SAVE_PATH=/downloads/anime
       - NYAA_BASE=https://nyaa.si/
       - TSUKIHIME_BASE=https://api.tsukihime.org/v1
       - JELLYFIN_URL=${JELLYFIN_URL:-}
@@ -24,7 +30,6 @@ services:
       - QBITTORRENT_USERNAME=${QBITTORRENT_USERNAME}
       - QBITTORRENT_PASSWORD=${QBITTORRENT_PASSWORD}
       - QBITTORRENT_CATEGORY=anime
-      - QBITTORRENT_SAVE_PATH=/downloads/anime
       - MIN_QUALITY=1080p
       - SCAN_INTERVAL_MINUTES=30
     volumes:
