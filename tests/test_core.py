@@ -888,3 +888,101 @@ def test_metadata_page_reports_episode_number_gaps(tmp_path, monkeypatch):
     assert "<td>2</td>" in html
 
 
+
+
+
+def test_anilist_graphql_retries_429_and_respects_retry_after(monkeypatch):
+    calls = []
+    sleeps = []
+
+    class Response:
+        def __init__(self, status_code, headers=None):
+            self.status_code = status_code
+            self.headers = headers or {}
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise requests.HTTPError(f"HTTP {self.status_code}")
+
+        def json(self):
+            return {"data": {"ok": True}}
+
+    responses = [Response(429, {"Retry-After": "3"}), Response(200)]
+    monkeypatch.setattr(main, "ANILIST_MIN_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(main, "ANILIST_MAX_RETRIES", 2)
+    monkeypatch.setattr(main, "_anilist_last_request", 0.0)
+    monkeypatch.setattr(main.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(main.requests, "post", lambda *args, **kwargs: (calls.append(1), responses.pop(0))[1])
+
+    assert main.anilist_graphql("query { Viewer { id } }", {}) == {"ok": True}
+    assert len(calls) == 2
+    assert 3.0 in sleeps
+
+
+def test_anilist_graphql_uses_exponential_backoff_without_retry_after(monkeypatch):
+    sleeps = []
+
+    class Response:
+        status_code = 429
+        headers = {}
+
+        def raise_for_status(self):
+            raise requests.HTTPError("HTTP 429")
+
+    responses = [Response(), Response(), type("Success", (), {
+        "status_code": 200, "headers": {},
+        "raise_for_status": lambda self: None,
+        "json": lambda self: {"data": {"ok": True}},
+    })()]
+    monkeypatch.setattr(main, "ANILIST_MIN_INTERVAL_SECONDS", 0)
+    monkeypatch.setattr(main, "ANILIST_MAX_RETRIES", 2)
+    monkeypatch.setattr(main, "_anilist_last_request", 0.0)
+    monkeypatch.setattr(main.time, "sleep", lambda seconds: sleeps.append(seconds))
+    monkeypatch.setattr(main.requests, "post", lambda *args, **kwargs: responses.pop(0))
+
+    assert main.anilist_graphql("query { Viewer { id } }", {}) == {"ok": True}
+    assert sleeps == [1.0, 2.0]
+
+
+def test_anilist_refresh_retries_cooled_down_rate_limits_but_skips_matches(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "db.sqlite3"))
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(main, "ANILIST_RETRY_COOLDOWN_MINUTES", 15)
+    with main.db() as conn:
+        matched_id = conn.execute(
+            "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("Already Matched", "Already Matched", "Already Matched", main.now(), main.now()),
+        ).lastrowid
+        retry_id = conn.execute(
+            "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at) VALUES(?,?,?,?,?)",
+            ("Retry Me", "Retry Me", "Retry Me", main.now(), main.now()),
+        ).lastrowid
+        conn.execute("INSERT INTO provider_ids(anime_id,provider,value) VALUES(?,?,?)",
+                     (retry_id, "AniList", "222"))
+        conn.execute("INSERT INTO metadata_sync VALUES(?,?,?,?)",
+                     (matched_id, "matched", "already done", main.now()))
+        conn.execute("INSERT INTO metadata_sync VALUES(?,?,?,?)",
+                     (retry_id, "rate_limited", "429", "2020-01-01T00:00:00+00:00"))
+        conn.commit()
+
+    calls = []
+    media = {"id": 222, "episodes": 12, "format": "TV",
+             "title": {"english": "Retry Me"}, "relations": {"edges": []}}
+    monkeypatch.setattr(main, "anilist_media", lambda media_id: (calls.append(media_id), media)[1])
+
+    assert main.refresh_anilist_expectations(limit=10, force=False) == 1
+    assert calls == [222]
+    with main.db() as conn:
+        assert conn.execute("SELECT status FROM metadata_sync WHERE anime_id=?", (matched_id,)).fetchone()[0] == "matched"
+        assert conn.execute("SELECT status FROM metadata_sync WHERE anime_id=?", (retry_id,)).fetchone()[0] == "matched"
+        assert conn.execute("SELECT expected_count FROM expected_seasons WHERE anime_id=?", (retry_id,)).fetchone()[0] == 12
+
+
+def test_anilist_refresh_lock_skips_overlapping_refresh(monkeypatch):
+    monkeypatch.setattr(main, "_refresh_anilist_expectations",
+                        lambda **kwargs: (_ for _ in ()).throw(AssertionError("overlapping refresh ran")))
+    assert main.ANILIST_REFRESH_LOCK.acquire(blocking=False)
+    try:
+        assert main.refresh_anilist_expectations(limit=3) == 0
+    finally:
+        main.ANILIST_REFRESH_LOCK.release()
