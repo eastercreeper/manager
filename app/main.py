@@ -198,6 +198,16 @@ def db() -> sqlite3.Connection:
       source_path TEXT NOT NULL, destination_path TEXT UNIQUE NOT NULL, imported_at TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS expected_seasons (
+      anime_id INTEGER NOT NULL REFERENCES anime(id) ON DELETE CASCADE,
+      season INTEGER NOT NULL, expected_count INTEGER NOT NULL,
+      anilist_id INTEGER NOT NULL, metadata_title TEXT NOT NULL,
+      updated_at TEXT NOT NULL, PRIMARY KEY(anime_id, season)
+    );
+    CREATE TABLE IF NOT EXISTS metadata_sync (
+      anime_id INTEGER PRIMARY KEY REFERENCES anime(id) ON DELETE CASCADE,
+      status TEXT NOT NULL, message TEXT NOT NULL DEFAULT '', checked_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS scan_history (
       id INTEGER PRIMARY KEY, kind TEXT NOT NULL, started_at TEXT NOT NULL, finished_at TEXT,
       status TEXT NOT NULL, message TEXT
@@ -936,7 +946,8 @@ def search_external_anime(query: str) -> list[dict]:
         json={"query": """query ($search: String) {
             Page(perPage: 20) {
                 media(search: $search, type: ANIME) {
-                    id title { romaji english native userPreferred }
+                    id episodes format status
+                    title { romaji english native userPreferred }
                     synonyms startDate { year } description
                 }
             }
@@ -974,6 +985,184 @@ def search_external_anime(query: str) -> list[dict]:
             "folder_name": title,
         })
     return results
+
+
+
+ANILIST_GRAPHQL_URL = "https://graphql.anilist.co"
+
+
+def anilist_graphql(query: str, variables: dict) -> dict:
+    response = requests.post(ANILIST_GRAPHQL_URL, json={"query": query, "variables": variables},
+                             headers={"Accept": "application/json", "Content-Type": "application/json"}, timeout=20)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict) or payload.get("errors") or not isinstance(payload.get("data"), dict):
+        raise RuntimeError("AniList returned an invalid metadata response")
+    return payload["data"]
+
+
+ANILIST_MEDIA_QUERY = """
+query ($id: Int) {
+  Media(id: $id, type: ANIME) {
+    id episodes format status title { romaji english native userPreferred } synonyms
+    relations { edges { relationType node { id type episodes format status
+      title { romaji english native userPreferred } synonyms } } }
+  }
+}
+"""
+
+
+def anilist_media(media_id: int) -> Optional[dict]:
+    return anilist_graphql(ANILIST_MEDIA_QUERY, {"id": int(media_id)}).get("Media")
+
+
+def anilist_titles(media: dict) -> list[str]:
+    title = media.get("title") or {}
+    values = [title.get(k) for k in ("english", "romaji", "native", "userPreferred")]
+    values.extend(media.get("synonyms") or [])
+    return list(dict.fromkeys(str(v).strip() for v in values if v and str(v).strip()))
+
+
+def anilist_sequel_candidates(media: dict) -> list[dict]:
+    result = []
+    for edge in (media.get("relations") or {}).get("edges", []):
+        node = edge.get("node") or {}
+        if edge.get("relationType") == "SEQUEL" and node.get("type") == "ANIME" \
+                and node.get("format") in {"TV", "TV_SHORT", "ONA"} and node.get("episodes"):
+            result.append(node)
+    return result
+
+
+def resolve_anilist_chain(root: dict) -> tuple[list[dict], bool]:
+    """Follow only unambiguous TV sequel links; do not guess across franchise branches."""
+    root_tokens = set(re.findall(r"[a-z0-9]+", normalize_title(" ".join(anilist_titles(root)))))
+    chain, seen, current = [root], {int(root["id"])}, root
+    for _ in range(8):
+        candidates = []
+        for item in anilist_sequel_candidates(current):
+            tokens = set(re.findall(r"[a-z0-9]+", normalize_title(" ".join(anilist_titles(item)))))
+            similarity = len(root_tokens & tokens) / len(root_tokens) if root_tokens else 0
+            if int(item.get("id") or 0) not in seen and similarity >= 0.60:
+                candidates.append(item)
+        if not candidates:
+            return chain, True
+        if len(candidates) != 1:
+            return chain, False
+        nxt = anilist_media(int(candidates[0]["id"]))
+        if not nxt or not nxt.get("episodes"):
+            return chain, False
+        chain.append(nxt)
+        seen.add(int(nxt["id"]))
+        current = nxt
+    return chain, False
+
+
+def exact_anilist_match(show: sqlite3.Row, aliases: list[str]) -> tuple[Optional[dict], str]:
+    query = str(show["title"] or "").strip()
+    if not query:
+        return None, "Show has no searchable title"
+    data = anilist_graphql("""query ($search: String) {
+      Page(perPage: 30) { media(search: $search, type: ANIME) {
+        id episodes format status title { romaji english native userPreferred }
+        synonyms startDate { year }
+      } }
+    }""", {"search": query})
+    targets = {normalize_title(v) for v in
+               [show["title"], show["folder_name"], show["search_query"], *aliases] if v}
+    exact = [item for item in data.get("Page", {}).get("media", [])
+             if item.get("episodes") and item.get("format") in {"TV", "TV_SHORT", "ONA"}
+             and any(normalize_title(v) in targets for v in anilist_titles(item))]
+    if len(exact) > 1 and show["year"]:
+        year_matches = [item for item in exact
+                        if str((item.get("startDate") or {}).get("year") or "") == str(show["year"])]
+        if len(year_matches) == 1:
+            exact = year_matches
+    if len(exact) != 1:
+        return None, ("No exact AniList title match; choose it from Search" if not exact
+                      else f"{len(exact)} exact matches; manual selection required")
+    return exact[0], ""
+
+
+def refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
+    """Match tracked anime to AniList and map linked TV sequels onto Jellyfin seasons."""
+    cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0).isoformat()
+    with closing(db()) as conn:
+        shows = conn.execute("""SELECT a.* FROM anime a LEFT JOIN metadata_sync m ON m.anime_id=a.id
+            WHERE ?=1 OR m.anime_id IS NULL OR m.checked_at < ?
+            ORDER BY CASE WHEN m.status='matched' THEN 1 ELSE 0 END,a.id LIMIT ?""",
+            (int(force), cutoff, max(1, int(limit)))).fetchall()
+    refreshed = 0
+    for show in shows:
+        anime_id = int(show["id"])
+        try:
+            with closing(db()) as conn:
+                aliases = [x["title"] for x in conn.execute(
+                    "SELECT title FROM alternate_titles WHERE anime_id=?", (anime_id,)).fetchall()]
+                provider = conn.execute("""SELECT value FROM provider_ids
+                    WHERE anime_id=? AND lower(provider)='anilist' LIMIT 1""", (anime_id,)).fetchone()
+                actual_seasons = sorted({int(x["season"] or 1) for x in conn.execute(
+                    "SELECT DISTINCT season FROM episodes WHERE anime_id=?", (anime_id,)).fetchall()})
+            if provider:
+                root = anilist_media(int(provider["value"]))
+                if not root:
+                    raise RuntimeError("Saved AniList ID did not return an anime entry")
+            else:
+                match, reason = exact_anilist_match(show, aliases)
+                if not match:
+                    with closing(db()) as conn:
+                        conn.execute("""INSERT INTO metadata_sync VALUES(?,?,?,?)
+                            ON CONFLICT(anime_id) DO UPDATE SET status=excluded.status,
+                            message=excluded.message,checked_at=excluded.checked_at""",
+                            (anime_id, "needs_review", reason, now()))
+                        conn.commit()
+                    refreshed += 1
+                    continue
+                root = anilist_media(int(match["id"]))
+                if not root:
+                    raise RuntimeError("AniList match could not be loaded")
+                with closing(db()) as conn:
+                    conn.execute("INSERT OR IGNORE INTO provider_ids(anime_id,provider,value) VALUES(?,?,?)",
+                                 (anime_id, "AniList", str(root["id"])))
+                    conn.commit()
+            if not root.get("episodes"):
+                raise RuntimeError("AniList entry has no episode count")
+            chain, unambiguous = resolve_anilist_chain(root)
+            seasons = actual_seasons or [1]
+            reason = ""
+            if not unambiguous:
+                reason = "Multiple possible sequel entries; manual review required"
+            elif len(chain) != len(seasons):
+                reason = (f"AniList found {len(chain)} linked TV entries, but Jellyfin has "
+                          f"{len(seasons)} seasons ({', '.join(map(str, seasons))}); mapping needs review")
+            with closing(db()) as conn:
+                if reason:
+                    conn.execute("""INSERT INTO metadata_sync VALUES(?,?,?,?)
+                        ON CONFLICT(anime_id) DO UPDATE SET status=excluded.status,
+                        message=excluded.message,checked_at=excluded.checked_at""",
+                        (anime_id, "needs_review", reason, now()))
+                else:
+                    conn.execute("DELETE FROM expected_seasons WHERE anime_id=?", (anime_id,))
+                    for season_no, media in zip(seasons, chain):
+                        conn.execute("""INSERT INTO expected_seasons
+                            (anime_id,season,expected_count,anilist_id,metadata_title,updated_at)
+                            VALUES(?,?,?,?,?,?)""",
+                            (anime_id, season_no, int(media["episodes"]), int(media["id"]),
+                             next(iter(anilist_titles(media)), show["title"]), now()))
+                    conn.execute("""INSERT INTO metadata_sync VALUES(?,?,?,?)
+                        ON CONFLICT(anime_id) DO UPDATE SET status=excluded.status,
+                        message=excluded.message,checked_at=excluded.checked_at""",
+                        (anime_id, "matched", f"Matched {len(chain)} AniList season entr{'y' if len(chain)==1 else 'ies'}", now()))
+                conn.commit()
+            refreshed += 1
+        except (ValueError, KeyError, TypeError, RuntimeError, requests.RequestException, sqlite3.Error) as exc:
+            with closing(db()) as conn:
+                conn.execute("""INSERT INTO metadata_sync VALUES(?,?,?,?)
+                    ON CONFLICT(anime_id) DO UPDATE SET status=excluded.status,
+                    message=excluded.message,checked_at=excluded.checked_at""",
+                    (anime_id, "error", str(exc)[:500], now()))
+                conn.commit()
+            refreshed += 1
+    return refreshed
 
 
 def import_completed() -> int:
@@ -1101,6 +1290,12 @@ def background_sync() -> None:
     except (RuntimeError, requests.RequestException, sqlite3.Error) as exc:
         print(f"Jellyfin sync failed: {exc}", flush=True)
     try:
+        refreshed = refresh_anilist_expectations(limit=3)
+        if refreshed:
+            print(f"AniList metadata reconciled for {refreshed} anime", flush=True)
+    except (RuntimeError, ValueError, requests.RequestException, sqlite3.Error) as exc:
+        print(f"AniList metadata sync failed: {exc}", flush=True)
+    try:
         scan_sources()
     except (RuntimeError, requests.RequestException, sqlite3.Error) as exc:
         print(f"Release scan failed: {exc}", flush=True)
@@ -1160,7 +1355,7 @@ input,button,select{font:inherit;padding:9px;border-radius:8px;border:1px solid 
 button.danger{background:#85464b}form.inline{display:inline}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:9px 7px;border-bottom:1px solid #303646;vertical-align:top}a{color:#b9adff}.pill{font-size:12px;color:#c7cbe0}
 nav a{margin-right:15px} .stat{font-size:24px;font-weight:700}
-</style></head><body><h1>Anime Manager</h1><nav><a href="/">Dashboard</a><a href="/library">My Library</a><a href="/search">Search</a><a href="/episodes">New Episodes</a><a href="/downloads">Downloads</a><a href="/history">History</a><a href="/settings">Settings</a></nav>
+</style></head><body><h1>Anime Manager</h1><nav><a href="/">Dashboard</a><a href="/library">My Library</a><a href="/search">Search</a><a href="/episodes">New Episodes</a><a href="/metadata">Metadata</a><a href="/downloads">Downloads</a><a href="/history">History</a><a href="/settings">Settings</a></nav>
 {% if message %}<p class="panel">{{message}}</p>{% endif %}{{ body|safe }}</body></html>""")
 
 
@@ -1361,6 +1556,49 @@ def release_detail(release_id: int) -> HTMLResponse:
 def sync() -> RedirectResponse:
     background_sync()
     return RedirectResponse("/", status_code=303)
+
+
+
+@app.get("/metadata", response_class=HTMLResponse)
+def metadata_page() -> HTMLResponse:
+    with closing(db()) as conn:
+        shows = conn.execute("""SELECT a.id,a.title,m.status,m.message FROM anime a
+            LEFT JOIN metadata_sync m ON m.anime_id=a.id ORDER BY a.title""").fetchall()
+        rows = []
+        for show in shows:
+            expected_rows = conn.execute("""SELECT season,expected_count,metadata_title
+                FROM expected_seasons WHERE anime_id=? ORDER BY season""", (show["id"],)).fetchall()
+            if expected_rows:
+                for expected in expected_rows:
+                    actual = {int(x["episode"]) for x in conn.execute("""SELECT episode FROM episodes
+                        WHERE anime_id=? AND season=? AND status='available' AND has_file=1
+                        AND episode IS NOT NULL""", (show["id"],expected["season"])).fetchall()}
+                    missing = sorted(set(range(1,int(expected["expected_count"])+1))-actual)
+                    rows.append({"title":show["title"],"season":expected["season"],
+                        "expected":expected["expected_count"],"actual":len(actual),
+                        "missing":", ".join(map(str,missing[:30]))+("…" if len(missing)>30 else ""),
+                        "status":"complete" if not missing else f"{len(missing)} missing",
+                        "message":expected["metadata_title"]})
+            else:
+                rows.append({"title":show["title"],"season":"—","expected":"—","actual":"—",
+                    "missing":"—","status":show["status"] or "not checked",
+                    "message":show["message"] or "No AniList mapping yet"})
+    body = template("""<div class="panel"><div class="row"><h2 style="flex:1">Episode reconciliation</h2>
+        <form method="post" action="/metadata/refresh"><button>Refresh AniList matches</button></form></div>
+        <p class="muted">Expected counts come from AniList. Actual episodes are read from Jellyfin and checked against files. Ambiguous mappings are not guessed.</p>
+        <table><tr><th>Anime</th><th>Season</th><th>Expected</th><th>Present</th><th>Missing episode numbers</th><th>Status</th></tr>
+        {% for r in rows %}<tr><td>{{r.title}}</td><td>{{r.season}}</td><td>{{r.expected}}</td><td>{{r.actual}}</td><td>{{r.missing}}</td><td>{{r.status}}<br><span class="muted">{{r.message}}</span></td></tr>
+        {% else %}<tr><td colspan="6">No tracked anime.</td></tr>{% endfor %}</table></div>""").render(rows=rows)
+    return page(body)
+
+
+@app.post("/metadata/refresh")
+def metadata_refresh() -> RedirectResponse:
+    try:
+        refreshed = refresh_anilist_expectations(limit=10, force=True)
+    except (RuntimeError, ValueError, requests.RequestException, sqlite3.Error) as exc:
+        raise HTTPException(502, str(exc)) from exc
+    return RedirectResponse(f"/metadata?refreshed={refreshed}", status_code=303)
 
 
 @app.get("/episodes", response_class=HTMLResponse)
