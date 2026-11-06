@@ -28,6 +28,7 @@ type Service struct { app *core.App; db *gorm.DB; jf *jellyfin.Client }
 func Register(app *core.App, v1 *echo.Group) {
  if app == nil || app.Database == nil { return }
  s := &Service{app:app,db:app.Database.Gorm()}
+ s.installScannerMappingHook()
  if err := s.db.AutoMigrate(&JellyfinSeries{},&JellyfinEpisode{},&ReleaseApproval{},&MediaVerification{}); err != nil {
   app.Logger.Error().Err(err).Msg("manager: extension schema migration failed"); return
  }
@@ -118,11 +119,11 @@ func (s *Service) listApprovals(c echo.Context) error {
  var rows []ReleaseApproval;if err:=s.db.Order("created_at desc").Limit(500).Find(&rows).Error;err!=nil{return c.JSON(500,map[string]string{"error":err.Error()})};return c.JSON(200,rows)
 }
 func (s *Service) createApproval(c echo.Context) error {
- var b struct{Title string `json:"title"`;Link string `json:"link"`;MediaID int `json:"mediaId"`;EpisodeNumber int `json:"episodeNumber"`;SavePath string `json:"savePath"`;Category string `json:"category"`}
+ var b struct{Title string `json:"title"`;Link string `json:"link"`;MediaID int `json:"mediaId"`;EpisodeNumber int `json:"episodeNumber"`;SeasonNumber int `json:"seasonNumber"`;JellyfinSeriesID string `json:"jellyfinSeriesId"`;SavePath string `json:"savePath"`;Category string `json:"category"`}
  if c.Bind(&b)!=nil{return c.JSON(400,map[string]string{"error":"invalid JSON body"})}
  u,err:=url.Parse(strings.TrimSpace(b.Link));if err!=nil||(u.Scheme!="magnet"&&u.Scheme!="http"&&u.Scheme!="https"){return c.JSON(400,map[string]string{"error":"link must be magnet, HTTP, or HTTPS"})}
  if strings.TrimSpace(b.Title)==""||!filepath.IsAbs(b.SavePath){return c.JSON(400,map[string]string{"error":"title and absolute savePath are required"})}
- row:=ReleaseApproval{Title:b.Title,Link:b.Link,MediaID:b.MediaID,EpisodeNumber:b.EpisodeNumber,SavePath:filepath.Clean(b.SavePath),Category:b.Category,Status:"pending"}
+ season:=b.SeasonNumber;if season==0{season=1};row:=ReleaseApproval{Title:b.Title,Link:b.Link,MediaID:b.MediaID,EpisodeNumber:b.EpisodeNumber,SeasonNumber:season,JellyfinSeriesID:strings.TrimSpace(b.JellyfinSeriesID),SavePath:filepath.Clean(b.SavePath),Category:b.Category,Status:"pending"}
  if err:=s.db.Create(&row).Error;err!=nil{return c.JSON(500,map[string]string{"error":err.Error()})};return c.JSON(201,row)
 }
 func (s *Service) qbClient() (*qbittorrent.Client,error) {
@@ -172,36 +173,57 @@ func (s *Service) verifyEpisode(c echo.Context) error {
 }
 
  
-// reconcileDownloads uses Seanime's qBittorrent client implementation. A
-// completed torrent is never equated with a verified Jellyfin episode: it
-// triggers a Jellyfin refresh, after which the filesystem/ffprobe verifier
-// can confirm the actual episode.
+// reconcileDownloads checks approved torrents and imports completed media into the
+// selected Jellyfin series/season directory. Source files remain in qBittorrent's
+// save path so active seeding is preserved.
 func (s *Service) reconcileDownloads(c echo.Context) error {
  client,err:=s.qbClient();if err!=nil{return c.JSON(503,map[string]string{"error":err.Error()})}
  list,err:=client.Torrent.GetList(&qbmodel.GetTorrentListOptions{Filter:qbmodel.FilterAll})
  if err!=nil{return c.JSON(502,map[string]string{"error":"qBittorrent list: "+err.Error()})}
  var approvals []ReleaseApproval
- if err:=s.db.Where("status = ?","approved").Find(&approvals).Error;err!=nil{return c.JSON(500,map[string]string{"error":err.Error()})}
- changed:=0
- for _,a:=range approvals {
+ if err:=s.db.Where("status IN ?",[]string{"approved","downloaded"}).Find(&approvals).Error;err!=nil{return c.JSON(500,map[string]string{"error":err.Error()})}
+ newlyDownloaded,imported:=0,0
+ importErrors:=make([]map[string]any,0)
+ for i:=range approvals {
+  a:=&approvals[i]
   for _,t:=range list {
-   if !strings.Contains(t.Tags,"anime-manager") {continue}
-   match:=false
-   if h:=magnetHash(a.Link);h!="" {match=strings.EqualFold(h,t.InfohashV1)||strings.EqualFold(h,t.InfohashV2)}
-   if !match && strings.TrimSpace(a.Title)!="" {match=strings.Contains(strings.ToLower(t.Name),strings.ToLower(a.Title))}
-   if !match || t.Progress<0.9999 {continue}
-   now:=time.Now().UTC()
-   if err:=s.db.Model(&a).Updates(map[string]any{"status":"downloaded","qbittorrent_hash":t.Hash,"decision_at":now}).Error;err==nil {changed++}
+   if !strings.Contains(t.Tags,"anime-manager"){continue}
+   match:=a.QBittorrentHash!=""&&strings.EqualFold(a.QBittorrentHash,t.Hash)
+   if !match { if h:=magnetHash(a.Link);h!=""{match=strings.EqualFold(h,t.InfohashV1)||strings.EqualFold(h,t.InfohashV2)} }
+   if !match&&strings.TrimSpace(a.Title)!=""{match=strings.Contains(strings.ToLower(t.Name),strings.ToLower(a.Title))}
+   if !match||t.Progress<0.9999{continue}
+   if a.Status=="approved" {
+    now:=time.Now().UTC()
+    if err:=s.db.Model(a).Updates(map[string]any{"status":"downloaded","qbittorrent_hash":t.Hash,"decision_at":now,"import_error":""}).Error;err!=nil {
+     importErrors=append(importErrors,map[string]any{"approvalId":a.ID,"error":"save completion state: "+err.Error()});break
+    }
+    a.Status="downloaded";a.QBittorrentHash=t.Hash;a.DecisionAt=&now;newlyDownloaded++
+   }
+   paths,importErr:=s.importCompletedTorrent(a,t,client)
+   if importErr!=nil {
+    _=s.db.Model(a).Update("import_error",importErr.Error()).Error
+    a.ImportError=importErr.Error()
+    importErrors=append(importErrors,map[string]any{"approvalId":a.ID,"title":a.Title,"error":importErr.Error()})
+    break
+   }
+   markImported(a,paths)
+   if err:=s.db.Model(a).Updates(map[string]any{"status":a.Status,"imported_at":a.ImportedAt,"imported_paths":a.ImportedPaths,"import_error":""}).Error;err!=nil {
+    importErrors=append(importErrors,map[string]any{"approvalId":a.ID,"error":"save import state: "+err.Error()})
+   } else { imported++ }
    break
   }
  }
- jf, jfErr:=s.jellyfin()
+ jf,jfErr:=s.jellyfin()
  refreshed:=false
- if changed>0 && jfErr==nil {
+ if (newlyDownloaded>0||imported>0)&&jfErr==nil {
   ctx,cancel:=context.WithTimeout(c.Request().Context(),30*time.Second);defer cancel()
-  if err:=jf.RefreshLibrary(ctx);err==nil {refreshed=true}
+  if err:=jf.RefreshLibrary(ctx);err==nil{refreshed=true}
  }
- return c.JSON(200,map[string]any{"checked":len(approvals),"newlyDownloaded":changed,"jellyfinRefreshRequested":refreshed,"note":"Downloaded torrents still require Jellyfin sync and episode media verification."})
+ return c.JSON(200,map[string]any{
+  "checked":len(approvals),"newlyDownloaded":newlyDownloaded,"imported":imported,
+  "jellyfinRefreshRequested":refreshed,"importErrors":importErrors,
+  "note":"Imported files are copied into Jellyfin's season folders; qBittorrent source files are retained for seeding. Sync Jellyfin and verify the resulting episode after the refresh.",
+ })
 }
 
 func magnetHash(link string) string {
