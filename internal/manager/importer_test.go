@@ -58,10 +58,16 @@ func TestCopyFileWithoutOverwriteIsIdempotentForSameSize(t *testing.T) {
 	if err := copyFileWithoutOverwrite(source, destination); err != nil {
 		t.Fatalf("same-size retry should be idempotent: %v", err)
 	}
+	if err := os.WriteFile(destination, []byte("diff"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyFileWithoutOverwrite(source, destination); err == nil {
+		t.Fatal("expected same-size but different-content file to be protected")
+	}
 	if err := os.WriteFile(destination, []byte("different-size"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := copyFileWithoutOverwrite(source, destination); err == nil {
-		t.Fatal("expected existing different-size file to be protected")
+		t.Fatal("expected different-size file to be protected")
 	}
 }
