@@ -1101,7 +1101,8 @@ def refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
                 provider = conn.execute("""SELECT value FROM provider_ids
                     WHERE anime_id=? AND lower(provider)='anilist' LIMIT 1""", (anime_id,)).fetchone()
                 actual_seasons = sorted({int(x["season"] or 1) for x in conn.execute(
-                    "SELECT DISTINCT season FROM episodes WHERE anime_id=?", (anime_id,)).fetchall()})
+                    "SELECT DISTINCT season FROM episodes WHERE anime_id=?", (anime_id,)).fetchall()
+                    if int(x["season"] or 1) > 0})
             if provider:
                 root = anilist_media(int(provider["value"]))
                 if not root:
@@ -1127,13 +1128,16 @@ def refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
             if not root.get("episodes"):
                 raise RuntimeError("AniList entry has no episode count")
             chain, unambiguous = resolve_anilist_chain(root)
-            seasons = actual_seasons or [1]
+            # AniList sequel entries can reveal seasons that are completely absent from Jellyfin.
+            # Map the chain in order, including those missing seasons, but never compress a season gap.
+            highest_actual = max(actual_seasons or [1])
+            seasons = list(range(1, max(highest_actual, len(chain)) + 1))
             reason = ""
             if not unambiguous:
                 reason = "Multiple possible sequel entries; manual review required"
-            elif len(chain) != len(seasons):
-                reason = (f"AniList found {len(chain)} linked TV entries, but Jellyfin has "
-                          f"{len(seasons)} seasons ({', '.join(map(str, seasons))}); mapping needs review")
+            elif highest_actual > len(chain):
+                reason = (f"Jellyfin has season {highest_actual}, but AniList only identifies "
+                          f"{len(chain)} linked TV entries; mapping needs review")
             with closing(db()) as conn:
                 if reason:
                     conn.execute("""INSERT INTO metadata_sync VALUES(?,?,?,?)
