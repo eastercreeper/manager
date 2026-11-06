@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"os"
@@ -228,7 +229,10 @@ func copyFileWithoutOverwrite(source, destination string) error {
 	if info, err := os.Stat(destination); err == nil {
 		sourceInfo, sourceErr := os.Stat(source)
 		if sourceErr == nil && info.Size() == sourceInfo.Size() {
-			return nil
+			same, compareErr := sameFileContent(source, destination)
+			if compareErr == nil && same {
+				return nil
+			}
 		}
 		return fmt.Errorf("refusing to overwrite existing Jellyfin file: %s", destination)
 	} else if !os.IsNotExist(err) {
@@ -272,4 +276,30 @@ func markImported(a *ReleaseApproval, paths []string) {
 	a.ImportedAt = &now
 	a.ImportedPaths = strings.Join(paths, "\n")
 	a.ImportError = ""
+}
+
+func sameFileContent(a, b string) (bool, error) {
+	hash := func(path string) ([32]byte, error) {
+		var sum [32]byte
+		file, err := os.Open(path)
+		if err != nil {
+			return sum, err
+		}
+		defer file.Close()
+		h := sha256.New()
+		if _, err := io.Copy(h, file); err != nil {
+			return sum, err
+		}
+		copy(sum[:], h.Sum(nil))
+		return sum, nil
+	}
+	left, err := hash(a)
+	if err != nil {
+		return false, err
+	}
+	right, err := hash(b)
+	if err != nil {
+		return false, err
+	}
+	return left == right, nil
 }
