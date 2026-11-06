@@ -73,7 +73,7 @@ func (s *Service) syncJellyfin(c echo.Context) error {
  for _,item:=range series {
   if item.ID==""{continue}
   rec:=JellyfinSeries{JellyfinID:item.ID}
-  if err:=s.db.Where("jellyfin_id = ?",item.ID).Assign(map[string]any{"name":item.Name,"path":item.Path,"last_seen_at":now}).FirstOrCreate(&rec).Error;err!=nil{return c.JSON(500,map[string]string{"error":"save series: "+err.Error()})}
+  if err:=s.db.Where("jellyfin_id = ?",item.ID).Assign(map[string]any{"name":item.Name,"path":item.Path,"scan_path":resolveJellyfinPath(item.Path),"last_seen_at":now}).FirstOrCreate(&rec).Error;err!=nil{return c.JSON(500,map[string]string{"error":"save series: "+err.Error()})}
   seriesCount++
   episodes,err:=jf.ListEpisodes(ctx,item.ID);if err!=nil{return c.JSON(502,map[string]string{"error":fmt.Sprintf("episodes for %s: %v",item.Name,err)})}
   for _,ep:=range episodes {
@@ -91,7 +91,7 @@ func (s *Service) syncJellyfin(c echo.Context) error {
  scanQueued:=false
  if s.app.Settings!=nil && s.app.Settings.Library!=nil && s.app.AutoScanner!=nil {
   paths:=make([]string,0,len(series));seen:=map[string]bool{}
-  for _,item:=range series { p:=filepath.Clean(strings.TrimSpace(item.Path));if filepath.IsAbs(p)&&!seen[p] { if st,e:=os.Stat(p);e==nil&&st.IsDir(){seen[p]=true;paths=append(paths,p)} } }
+  for _,item:=range series { p:=resolveJellyfinPath(item.Path);if filepath.IsAbs(p)&&!seen[p] { if st,e:=os.Stat(p);e==nil&&st.IsDir(){seen[p]=true;paths=append(paths,p)} } }
   if len(paths)>0 {
    s.app.Settings.Library.LibraryPath=paths[0]
    s.app.Settings.Library.LibraryPaths=models.LibraryPaths(paths[1:])
