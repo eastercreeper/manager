@@ -54,6 +54,12 @@ type ItemsResponse struct {
 	TotalRecordCount int `json:"TotalRecordCount"`
 }
 
+// setAuth uses Jellyfin's MediaBrowser Authorization scheme. The legacy
+// X-Emby-Token header is rejected by newer Jellyfin releases.
+func (c *Client) setAuth(req *http.Request) {
+	req.Header.Set("Authorization", fmt.Sprintf("MediaBrowser Token=%q", c.apiKey))
+}
+
 func (c *Client) get(ctx context.Context, path string, q url.Values, dst any) error {
 	endpoint := c.baseURL + path
 	if len(q) > 0 {
@@ -61,7 +67,7 @@ func (c *Client) get(ctx context.Context, path string, q url.Values, dst any) er
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil { return fmt.Errorf("create Jellyfin request: %w", err) }
-	req.Header.Set("X-Emby-Token", c.apiKey)
+	c.setAuth(req)
 	req.Header.Set("Accept", "application/json")
 	resp, err := c.http.Do(req)
 	if err != nil { return fmt.Errorf("request Jellyfin: %w", err) }
@@ -101,27 +107,25 @@ func (c *Client) ListSeries(ctx context.Context, pageSize int) ([]Item, error) {
 	}
 }
 
- 
 // ListEpisodes returns the physical episode files belonging to a Jellyfin series.
 func (c *Client) ListEpisodes(ctx context.Context, seriesID string) ([]Item, error) {
- q := url.Values{"Fields": {"Path"}, "IsMissing": {"false"}}
- var response ItemsResponse
- if err := c.get(ctx, "/Shows/"+url.PathEscape(seriesID)+"/Episodes", q, &response); err != nil {
-  return nil, err
- }
- for i := range response.Items { response.Items[i].SeriesID = seriesID }
- return response.Items, nil
+	q := url.Values{"Fields": {"Path"}, "IsMissing": {"false"}}
+	var response ItemsResponse
+	if err := c.get(ctx, "/Shows/"+url.PathEscape(seriesID)+"/Episodes", q, &response); err != nil {
+		return nil, err
+	}
+	for i := range response.Items { response.Items[i].SeriesID = seriesID }
+	return response.Items, nil
 }
 
- 
 // RefreshLibrary asks Jellyfin to rescan its configured libraries.
 func (c *Client) RefreshLibrary(ctx context.Context) error {
- req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/Library/Refresh", nil)
- if err != nil { return fmt.Errorf("create Jellyfin refresh request: %w", err) }
- req.Header.Set("X-Emby-Token", c.apiKey)
- resp, err := c.http.Do(req)
- if err != nil { return fmt.Errorf("request Jellyfin library refresh: %w", err) }
- defer resp.Body.Close()
- if resp.StatusCode < 200 || resp.StatusCode >= 300 { return fmt.Errorf("Jellyfin returned %s refreshing library", resp.Status) }
- return nil
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/Library/Refresh", nil)
+	if err != nil { return fmt.Errorf("create Jellyfin refresh request: %w", err) }
+	c.setAuth(req)
+	resp, err := c.http.Do(req)
+	if err != nil { return fmt.Errorf("request Jellyfin library refresh: %w", err) }
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 { return fmt.Errorf("Jellyfin returned %s refreshing library", resp.Status) }
+	return nil
 }
