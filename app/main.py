@@ -523,6 +523,7 @@ def parse_release_episodes(title: str) -> tuple[Optional[int], list[int]]:
         (r"(?i)\b(?:episode|ep)\s*[._ -]?(\d{1,3})(?:\s*[-~&]\s*(\d{1,3}))?\b", False),
         (r"第\s*(\d{1,3})\s*(?:話|集)", False),
         (r"(?<![A-Za-z0-9])\[(\d{1,3})(?:\s*[~～-]\s*(\d{1,3}))?\]", False),
+        (r"(?<![A-Za-z0-9])-\s*(\d{1,3})(?:\s*[~～-]\s*(\d{1,3}))?(?=\s*(?:\[|$))", False),
     ]
     for pattern, has_season in patterns:
         match = re.search(pattern, title)
@@ -534,7 +535,9 @@ def parse_release_episodes(title: str) -> tuple[Optional[int], list[int]]:
         else:
             start = int(match.group(1))
             end = int(match.group(2) or start) if match.lastindex and match.lastindex >= 2 else start
-        if start < 1 or end < start or end - start > 100:
+        if start < 1 or start in {360, 480, 576, 720, 1080, 1440, 2160} or start >= 1900:
+            continue
+        if end < start or end - start > 100:
             continue
         return season, list(range(start, end + 1))
     return None, []
