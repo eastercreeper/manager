@@ -5,12 +5,14 @@ import shutil
 import sqlite3
 import subprocess
 import threading
+import time
 import urllib.parse
 import hashlib
 import hmac
 import secrets
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -43,6 +45,12 @@ SECURE_COOKIES = os.getenv("SECURE_COOKIES", "").lower() in {"1", "true", "yes"}
 SESSION_COOKIE = "anime_manager_session"
 CSRF_COOKIE = "anime_manager_csrf"
 DB_LOCK = threading.Lock()
+ANILIST_REFRESH_LOCK = threading.Lock()
+ANILIST_REQUEST_LOCK = threading.Lock()
+ANILIST_MIN_INTERVAL_SECONDS = max(0.0, float(os.getenv("ANILIST_MIN_INTERVAL_SECONDS", "1.1")))
+ANILIST_MAX_RETRIES = max(0, int(os.getenv("ANILIST_MAX_RETRIES", "2")))
+ANILIST_RETRY_COOLDOWN_MINUTES = max(1, int(os.getenv("ANILIST_RETRY_COOLDOWN_MINUTES", "15")))
+_anilist_last_request = 0.0
 scheduler = BackgroundScheduler(daemon=True)
 app = FastAPI(title="Anime Manager", version="1.0.0")
 templates = Environment(autoescape=select_autoescape(["html", "xml"]))
@@ -991,14 +999,69 @@ def search_external_anime(query: str) -> list[dict]:
 ANILIST_GRAPHQL_URL = "https://graphql.anilist.co"
 
 
+class AniListRateLimitError(requests.RequestException):
+    """AniList rejected a request because its rate limit was reached."""
+
+
+class AniListTemporaryError(requests.RequestException):
+    """A temporary AniList/network failure that should be retried later."""
+
+
+def _anilist_retry_after(response: requests.Response, attempt: int) -> float:
+    value = response.headers.get("Retry-After", "").strip()
+    if value:
+        try:
+            return max(0.0, float(value))
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(value)
+                return max(0.0, (retry_at - datetime.now(retry_at.tzinfo or timezone.utc)).total_seconds())
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return min(60.0, 2.0 ** attempt)
+
+
 def anilist_graphql(query: str, variables: dict) -> dict:
-    response = requests.post(ANILIST_GRAPHQL_URL, json={"query": query, "variables": variables},
-                             headers={"Accept": "application/json", "Content-Type": "application/json"}, timeout=20)
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict) or payload.get("errors") or not isinstance(payload.get("data"), dict):
-        raise RuntimeError("AniList returned an invalid metadata response")
-    return payload["data"]
+    global _anilist_last_request
+    request_body = {"query": query, "variables": variables}
+    headers = {"Accept": "application/json", "Content-Type": "application/json"}
+    for attempt in range(ANILIST_MAX_RETRIES + 1):
+        try:
+            with ANILIST_REQUEST_LOCK:
+                elapsed = time.monotonic() - _anilist_last_request
+                if _anilist_last_request and elapsed < ANILIST_MIN_INTERVAL_SECONDS:
+                    time.sleep(ANILIST_MIN_INTERVAL_SECONDS - elapsed)
+                response = requests.post(ANILIST_GRAPHQL_URL, json=request_body,
+                                         headers=headers, timeout=20)
+                _anilist_last_request = time.monotonic()
+                if response.status_code == 429:
+                    delay = _anilist_retry_after(response, attempt)
+                    if attempt >= ANILIST_MAX_RETRIES:
+                        raise AniListRateLimitError(
+                            f"AniList rate limit persisted after {attempt + 1} attempts"
+                        )
+                    time.sleep(delay)
+                    continue
+                if response.status_code >= 500:
+                    if attempt >= ANILIST_MAX_RETRIES:
+                        raise AniListTemporaryError(
+                            f"AniList server returned HTTP {response.status_code}"
+                        )
+                    time.sleep(min(30.0, 2.0 ** attempt))
+                    continue
+                response.raise_for_status()
+        except (AniListRateLimitError, AniListTemporaryError):
+            raise
+        except requests.RequestException as exc:
+            if attempt >= ANILIST_MAX_RETRIES:
+                raise AniListTemporaryError(str(exc)) from exc
+            time.sleep(min(30.0, 2.0 ** attempt))
+            continue
+        payload = response.json()
+        if not isinstance(payload, dict) or payload.get("errors") or not isinstance(payload.get("data"), dict):
+            raise RuntimeError("AniList returned an invalid metadata response")
+        return payload["data"]
+    raise AniListTemporaryError("AniList request retries exhausted")
 
 
 ANILIST_MEDIA_QUERY = """
@@ -1083,19 +1146,22 @@ def exact_anilist_match(show: sqlite3.Row, aliases: list[str]) -> tuple[Optional
     return exact[0], ""
 
 
-def refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
+def _refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
     """Match tracked anime to AniList and map linked TV sequels onto Jellyfin seasons."""
     cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0).isoformat()
-    with closing(db()) as conn:
+    retry_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=ANILIST_RETRY_COOLDOWN_MINUTES)).isoformat()
+    with DB_LOCK, closing(db()) as conn:
         shows = conn.execute("""SELECT a.* FROM anime a LEFT JOIN metadata_sync m ON m.anime_id=a.id
-            WHERE ?=1 OR m.anime_id IS NULL OR m.checked_at < ?
-            ORDER BY CASE WHEN m.status='matched' THEN 1 ELSE 0 END,a.id LIMIT ?""",
-            (int(force), cutoff, max(1, int(limit)))).fetchall()
+            WHERE ?=1 OR m.anime_id IS NULL OR
+              (m.status IN ('rate_limited','retryable_error') AND m.checked_at < ?) OR
+              (m.status NOT IN ('matched','needs_review','rate_limited','retryable_error') AND m.checked_at < ?)
+            ORDER BY CASE WHEN m.status IN ('matched','needs_review') THEN 1 ELSE 0 END,a.id LIMIT ?""",
+            (int(force), retry_cutoff, cutoff, max(1, int(limit)))).fetchall()
     refreshed = 0
     for show in shows:
         anime_id = int(show["id"])
         try:
-            with closing(db()) as conn:
+            with DB_LOCK, closing(db()) as conn:
                 aliases = [x["title"] for x in conn.execute(
                     "SELECT title FROM alternate_titles WHERE anime_id=?", (anime_id,)).fetchall()]
                 provider = conn.execute("""SELECT value FROM provider_ids
@@ -1110,7 +1176,7 @@ def refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
             else:
                 match, reason = exact_anilist_match(show, aliases)
                 if not match:
-                    with closing(db()) as conn:
+                    with DB_LOCK, closing(db()) as conn:
                         conn.execute("""INSERT INTO metadata_sync VALUES(?,?,?,?)
                             ON CONFLICT(anime_id) DO UPDATE SET status=excluded.status,
                             message=excluded.message,checked_at=excluded.checked_at""",
@@ -1121,7 +1187,7 @@ def refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
                 root = anilist_media(int(match["id"]))
                 if not root:
                     raise RuntimeError("AniList match could not be loaded")
-                with closing(db()) as conn:
+                with DB_LOCK, closing(db()) as conn:
                     conn.execute("INSERT OR IGNORE INTO provider_ids(anime_id,provider,value) VALUES(?,?,?)",
                                  (anime_id, "AniList", str(root["id"])))
                     conn.commit()
@@ -1138,7 +1204,7 @@ def refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
             elif highest_actual > len(chain):
                 reason = (f"Jellyfin has season {highest_actual}, but AniList only identifies "
                           f"{len(chain)} linked TV entries; mapping needs review")
-            with closing(db()) as conn:
+            with DB_LOCK, closing(db()) as conn:
                 if reason:
                     conn.execute("""INSERT INTO metadata_sync VALUES(?,?,?,?)
                         ON CONFLICT(anime_id) DO UPDATE SET status=excluded.status,
@@ -1158,8 +1224,18 @@ def refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
                         (anime_id, "matched", f"Matched {len(chain)} AniList season entr{'y' if len(chain)==1 else 'ies'}", now()))
                 conn.commit()
             refreshed += 1
+        except (AniListRateLimitError, AniListTemporaryError) as exc:
+            status = "rate_limited" if isinstance(exc, AniListRateLimitError) else "retryable_error"
+            with DB_LOCK, closing(db()) as conn:
+                conn.execute("""INSERT INTO metadata_sync VALUES(?,?,?,?)
+                    ON CONFLICT(anime_id) DO UPDATE SET status=excluded.status,
+                    message=excluded.message,checked_at=excluded.checked_at""",
+                    (anime_id, status, str(exc)[:500], now()))
+                conn.commit()
+            refreshed += 1
+            break
         except (ValueError, KeyError, TypeError, RuntimeError, requests.RequestException, sqlite3.Error) as exc:
-            with closing(db()) as conn:
+            with DB_LOCK, closing(db()) as conn:
                 conn.execute("""INSERT INTO metadata_sync VALUES(?,?,?,?)
                     ON CONFLICT(anime_id) DO UPDATE SET status=excluded.status,
                     message=excluded.message,checked_at=excluded.checked_at""",
@@ -1167,6 +1243,16 @@ def refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
                 conn.commit()
             refreshed += 1
     return refreshed
+
+
+def refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
+    """Prevent scheduler and manual requests from running metadata refresh concurrently."""
+    if not ANILIST_REFRESH_LOCK.acquire(blocking=False):
+        return 0
+    try:
+        return _refresh_anilist_expectations(limit=limit, force=force)
+    finally:
+        ANILIST_REFRESH_LOCK.release()
 
 
 def import_completed() -> int:
@@ -1603,7 +1689,7 @@ def metadata_page() -> HTMLResponse:
 @app.post("/metadata/refresh")
 def metadata_refresh() -> RedirectResponse:
     try:
-        refreshed = refresh_anilist_expectations(limit=10, force=True)
+        refreshed = refresh_anilist_expectations(limit=3, force=False)
     except (RuntimeError, ValueError, requests.RequestException, sqlite3.Error) as exc:
         raise HTTPException(502, str(exc)) from exc
     return RedirectResponse(f"/metadata?refreshed={refreshed}", status_code=303)
