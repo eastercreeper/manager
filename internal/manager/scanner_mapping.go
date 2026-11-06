@@ -22,7 +22,7 @@ func (s *Service) installScannerMappingHook() {
 		}
 
 		var shows []JellyfinSeries
-		if err := s.db.Where("ani_list_id > 0").Find(&shows).Error; err != nil {
+		if err := s.db.Where("ani_list_id > 0 AND (mapping_source = ? OR mapping_source = ?)", "manual", "").Find(&shows).Error; err != nil {
 			s.app.Logger.Error().Err(err).Msg("manager: load AniList overrides for scanner")
 			return resolver.Next()
 		}
@@ -88,11 +88,17 @@ func (s *Service) installScannerMappingHook() {
 			return resolver.Next()
 		}
 		var shows []JellyfinSeries
-		if err := s.db.Where("ani_list_id > 0").Find(&shows).Error; err != nil {
-			s.app.Logger.Error().Err(err).Msg("manager: load AniList overrides for completed scan")
+		if err := s.db.Find(&shows).Error; err != nil {
+			s.app.Logger.Error().Err(err).Msg("manager: load Jellyfin series after completed scan")
 			return resolver.Next()
 		}
-		applySeriesOverrides(event.LocalFiles, shows)
+		manualShows := make([]JellyfinSeries, 0, len(shows))
+		for _, show := range shows {
+			if show.MappingSource == "manual" || (show.AniListID > 0 && show.MappingSource == "") {
+				manualShows = append(manualShows, show)
+			}
+		}
+		applySeriesOverrides(event.LocalFiles, manualShows)
 		// Persist Seanime's native matcher results back to Jellyfin records.
 		// Existing mappings without a source are treated as manual for safety.
 		for _, show := range shows {
