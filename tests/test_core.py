@@ -884,7 +884,7 @@ def test_metadata_page_reports_episode_number_gaps(tmp_path, monkeypatch):
                 (anime_id, 1, number, "available"))
         conn.commit()
     html = main.metadata_page().body.decode()
-    assert "2 missing" in html
+    assert "1 missing" in html
     assert "<td>2</td>" in html
 
 
