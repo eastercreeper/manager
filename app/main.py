@@ -384,7 +384,12 @@ class QBitClient:
         response = sess.post(self.url + "/api/v2/auth/login",
                              data={"username": self.user, "password": self.password},
                              headers={"Referer": self.url}, timeout=15)
-        if response.status_code != 200 or response.text.strip() != "Ok.":
+        # qBittorrent 5.3 may return HTTP 204 with a valid session cookie
+        # instead of the older HTTP 200 / "Ok." response.
+        if response.status_code == 204:
+            if not sess.cookies:
+                raise RuntimeError("qBittorrent login failed")
+        elif response.status_code != 200 or response.text.strip() != "Ok.":
             raise RuntimeError("qBittorrent login failed")
         return sess
 
