@@ -26,7 +26,7 @@ func (s *Service) installScannerMappingHook() {
 			s.app.Logger.Error().Err(err).Msg("manager: load AniList overrides for scanner")
 			return resolver.Next()
 		}
-		sort.Slice(shows, func(i, j int) bool { return len(shows[i].Path) > len(shows[j].Path) })
+		sort.Slice(shows, func(i, j int) bool { return len(seriesScanPath(shows[i])) > len(seriesScanPath(shows[j])) })
 
 		mediaByID := make(map[int]bool, len(event.NormalizedMedia))
 		for _, media := range event.NormalizedMedia {
@@ -63,10 +63,10 @@ func (s *Service) installScannerMappingHook() {
 				continue
 			}
 			for _, show := range shows {
-				if show.AniListID <= 0 || !mediaByID[show.AniListID] || strings.TrimSpace(show.Path) == "" {
+				if show.AniListID <= 0 || !mediaByID[show.AniListID] || strings.TrimSpace(seriesScanPath(show)) == "" {
 					continue
 				}
-				root, err := filepath.Abs(filepath.Clean(show.Path))
+				root, err := filepath.Abs(filepath.Clean(seriesScanPath(show)))
 				if err != nil {
 					continue
 				}
@@ -105,7 +105,7 @@ func (s *Service) installScannerMappingHook() {
 			if show.MappingSource == "manual" || (show.AniListID > 0 && show.MappingSource == "") {
 				continue
 			}
-			ids := matchedMediaIDsForPath(event.LocalFiles, show.Path)
+			ids := matchedMediaIDsForPath(event.LocalFiles, seriesScanPath(show))
 			if len(ids) == 1 {
 				for id := range ids {
 					if id > 0 && id != show.AniListID {
@@ -167,4 +167,11 @@ func matchedMediaIDsForPath(localFiles []*anime.LocalFile, seriesPath string) ma
 		}
 	}
 	return ids
+}
+
+func seriesScanPath(show JellyfinSeries) string {
+	if strings.TrimSpace(show.ScanPath) != "" {
+		return show.ScanPath
+	}
+	return show.Path
 }
