@@ -1219,9 +1219,21 @@ def home() -> HTMLResponse:
             "pending": "SELECT count(*) FROM releases WHERE status='pending'",
             "attention": "SELECT count(*) FROM downloads WHERE state='needs_review'"}.items()}
         releases = [dict(row) for row in conn.execute("""SELECT r.*,a.title anime_title FROM releases r JOIN anime a ON a.id=r.anime_id
-            WHERE r.status='pending' ORDER BY r.score DESC,r.id DESC LIMIT 50""").fetchall()]
+            WHERE r.status='pending' ORDER BY r.score DESC,r.id DESC LIMIT 500""").fetchall()]
+        visible_releases = []
         for release in releases:
-            release["page_url"] = safe_external_url(release["page_url"])
+            show = conn.execute("SELECT * FROM anime WHERE id=?", (release["anime_id"],)).fetchone()
+            aliases = [row["title"] for row in conn.execute(
+                "SELECT title FROM alternate_titles WHERE anime_id=?", (release["anime_id"],)
+            ).fetchall()]
+            if show and release_title_matches(show, release["title"], aliases) and release_has_missing_episodes(
+                conn, release["anime_id"], release["title"]
+            ):
+                release["page_url"] = safe_external_url(release["page_url"])
+                visible_releases.append(release)
+            if len(visible_releases) >= 50:
+                break
+        releases = visible_releases
     body = template("""<div class="row">{% for k,v in stats.items() %}<div class="panel"><div class="muted">{{k}}</div><div class="stat">{{v}}</div></div>{% endfor %}</div>
     <div class="panel"><div class="row"><h2 style="flex:1">Awaiting approval</h2><form method="post" action="/sync"><button>Sync now</button></form></div>
     <table><tr><th>Release</th><th>Anime</th><th>Score</th><th>Action</th></tr>{% for r in releases %}<tr><td><a href="{{r.page_url}}" target="_blank" rel="noreferrer">{{r.title}}</a><br><span class="muted">{{r.source}} · {{r.score_reason}}</span></td><td>{{r.anime_title}}</td><td>{{"%.1f"|format(r.score)}}</td><td><form class="inline" method="post" action="/releases/{{r.id}}/approve"><button>Approve</button></form><form class="inline" method="post" action="/releases/{{r.id}}/reject"><button class="danger">Reject</button></form></td></tr>{% else %}<tr><td colspan="4" class="muted">Nothing awaiting approval.</td></tr>{% endfor %}</table></div>""").render(stats=stats, releases=releases)
