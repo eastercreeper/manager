@@ -36,6 +36,7 @@ func Register(app *core.App, v1 *echo.Group) {
  }
  g:=v1.Group("/manager")
  if token:=strings.TrimSpace(os.Getenv("MANAGER_API_TOKEN")); token!="" { g.Use(func(next echo.HandlerFunc) echo.HandlerFunc { return func(c echo.Context) error { if c.Request().Header.Get("Authorization")!="Bearer "+token { return c.JSON(401,map[string]string{"error":"unauthorized"}) }; return next(c) } }) }
+ g.GET("/ui",s.ui)
  g.GET("/health",s.health)
  g.GET("/jellyfin/status",s.jellyfinStatus)
  g.POST("/jellyfin/sync",s.syncJellyfin)
