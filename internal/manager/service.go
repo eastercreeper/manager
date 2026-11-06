@@ -19,6 +19,7 @@ import (
 
  "github.com/labstack/echo/v4"
  "github.com/rs/zerolog"
+ qbmodel "seanime/internal/torrent_clients/qbittorrent/model"
  "gorm.io/gorm"
 )
 
@@ -45,6 +46,8 @@ func Register(app *core.App, v1 *echo.Group) {
  g.POST("/approvals/:id/approve",s.approve)
  g.POST("/approvals/:id/reject",s.reject)
  g.POST("/episodes/:jellyfinId/verify",s.verifyEpisode)
+ g.POST("/downloads/reconcile",s.reconcileDownloads)
+ if token:=strings.TrimSpace(os.Getenv("MANAGER_API_TOKEN")); token!="" { g.Use(func(next echo.HandlerFunc) echo.HandlerFunc { return func(c echo.Context) error { if c.Request().Header.Get("Authorization")!="Bearer "+token { return c.JSON(401,map[string]string{"error":"unauthorized"}) }; return next(c) } }) }
 }
 func (s *Service) jellyfin() (*jellyfin.Client,error) {
  if s.jf==nil { return nil,errors.New("configure JELLYFIN_URL and JELLYFIN_API_KEY") }; return s.jf,nil
@@ -148,4 +151,46 @@ func (s *Service) verifyEpisode(c echo.Context) error {
  }
  if err:=s.db.Where("jellyfin_episode_id = ?",ep.JellyfinID).Assign(result).FirstOrCreate(&result).Error;err!=nil{return c.JSON(500,map[string]string{"error":err.Error()})}
  return c.JSON(200,result)
+}
+
+ 
+// reconcileDownloads uses Seanime's qBittorrent client implementation. A
+// completed torrent is never equated with a verified Jellyfin episode: it
+// triggers a Jellyfin refresh, after which the filesystem/ffprobe verifier
+// can confirm the actual episode.
+func (s *Service) reconcileDownloads(c echo.Context) error {
+ client,err:=s.qbClient();if err!=nil{return c.JSON(503,map[string]string{"error":err.Error()})}
+ list,err:=client.Torrent.GetList(&qbmodel.GetTorrentListOptions{Filter:qbmodel.FilterAll})
+ if err!=nil{return c.JSON(502,map[string]string{"error":"qBittorrent list: "+err.Error()})}
+ var approvals []ReleaseApproval
+ if err:=s.db.Where("status = ?","approved").Find(&approvals).Error;err!=nil{return c.JSON(500,map[string]string{"error":err.Error()})}
+ changed:=0
+ for _,a:=range approvals {
+  for _,t:=range list {
+   if !strings.Contains(t.Tags,"anime-manager") {continue}
+   match:=false
+   if h:=magnetHash(a.Link);h!="" {match=strings.EqualFold(h,t.InfohashV1)||strings.EqualFold(h,t.InfohashV2)}
+   if !match && strings.TrimSpace(a.Title)!="" {match=strings.Contains(strings.ToLower(t.Name),strings.ToLower(a.Title))}
+   if !match || t.Progress<0.9999 {continue}
+   now:=time.Now().UTC()
+   if err:=s.db.Model(&a).Updates(map[string]any{"status":"downloaded","qbittorrent_hash":t.Hash,"decision_at":now}).Error;err==nil {changed++}
+   break
+  }
+ }
+ jf, jfErr:=s.jellyfin()
+ refreshed:=false
+ if changed>0 && jfErr==nil {
+  ctx,cancel:=context.WithTimeout(c.Request().Context(),30*time.Second);defer cancel()
+  if err:=jf.RefreshLibrary(ctx);err==nil {refreshed=true}
+ }
+ return c.JSON(200,map[string]any{"checked":len(approvals),"newlyDownloaded":changed,"jellyfinRefreshRequested":refreshed,"note":"Downloaded torrents still require Jellyfin sync and episode media verification."})
+}
+
+func magnetHash(link string) string {
+ u,err:=url.Parse(link);if err!=nil{return ""}
+ for _,xt:=range u.Query()["xt"] {
+  lower:=strings.ToLower(xt)
+  if strings.HasPrefix(lower,"urn:btih:"){return xt[len("urn:btih:"):]}
+ }
+ return ""
 }
