@@ -33,10 +33,15 @@ type ReleaseApproval struct {
  Link string `gorm:"size:4096" json:"link"`
  MediaID int `json:"mediaId"`
  EpisodeNumber int `json:"episodeNumber"`
+ SeasonNumber int `json:"seasonNumber"`
+ JellyfinSeriesID string `gorm:"index;size:128" json:"jellyfinSeriesId,omitempty"`
  SavePath string `gorm:"size:2048" json:"savePath"`
  Category string `gorm:"size:128" json:"category"`
  Status string `gorm:"index;size:32" json:"status"`
  QBittorrentHash string `gorm:"size:128" json:"qbittorrentHash,omitempty"`
+ ImportedAt *time.Time `json:"importedAt,omitempty"`
+ ImportedPaths string `gorm:"type:text" json:"importedPaths,omitempty"`
+ ImportError string `gorm:"type:text" json:"importError,omitempty"`
  DecisionAt *time.Time `json:"decisionAt,omitempty"`
  CreatedAt time.Time `json:"createdAt"`
  UpdatedAt time.Time `json:"updatedAt"`
