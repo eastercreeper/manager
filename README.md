@@ -2,7 +2,7 @@
 
 A standalone Jellyfin-focused anime management application built by adapting the actual Go backend of [Seanime](https://github.com/5rahim/seanime).
 
-**Status: upstream source imported; integration in progress.** This branch is not deployable yet. The previous Python application and its database are intentionally not being migrated.
+**Status: Seanime root application and Jellyfin manager extensions implemented; CI validation in progress.** This branch is not production-deployed. The previous Python application and its database are intentionally not being migrated.
 
 ## Design rules
 
