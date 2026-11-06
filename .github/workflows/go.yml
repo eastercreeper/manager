@@ -1,0 +1,42 @@
+name: Go rewrite CI
+
+on:
+  push:
+    branches:
+      - rewrite/go-backend
+  pull_request:
+    branches:
+      - rewrite/go-backend
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: seanime-web/package-lock.json
+      - name: Build Seanime frontend for embedding
+        working-directory: seanime-web
+        run: |
+          npm ci
+          npm run build
+          mkdir -p ../web
+          cp -a out/. ../web/
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Unit tests
+        run: go test ./internal/jellyfin/... ./internal/manager/...
+      - name: Build full application
+        run: go build -trimpath -o /tmp/anime-manager .
+      - name: Vet manager integration
+        run: go vet ./internal/jellyfin/... ./internal/manager/...
+      - name: Build container image
+        run: docker build -t anime-manager:ci .

@@ -1,0 +1,19 @@
+services:
+  anime-manager:
+    build: .
+    container_name: anime-manager
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    env_file:
+      - .env
+    volumes:
+      - anime-manager-data:/data
+      # Example based on the TrueNAS Jellyfin dataset path. Keep the same
+      # absolute path inside the container because Jellyfin reports this path.
+      - /mnt/Jellyfin/JellyfinData:/mnt/Jellyfin/JellyfinData:rw
+      # Mount the qBittorrent download directory at the exact same absolute
+      # path qBittorrent reports (for example /mnt/downloads:/mnt/downloads:ro).
+      # Imports copy completed files; the source mount can remain read-only.
+volumes:
+  anime-manager-data:

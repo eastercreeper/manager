@@ -1,0 +1,9 @@
+.git
+.github
+upstream/seanime
+seanime-web/node_modules
+seanime-web/out
+seanime-web/out-denshi
+app
+requirements.txt
+PROMOTION_REQUEST.md

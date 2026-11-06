@@ -1,0 +1,1 @@
+This marker intentionally triggers the one-time promotion of the pinned Seanime source into the root application module. It can be removed after promotion.
