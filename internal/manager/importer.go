@@ -14,7 +14,7 @@ import (
 	qbmodel "seanime/internal/torrent_clients/qbittorrent/model"
 )
 
-var videoExtensions = map[string]bool{
+var subtitleExtensions = map[string]bool{".ass": true, ".ssa": true, ".srt": true, ".vtt": true, ".sub": true, ".idx": true}\n\nvar videoExtensions = map[string]bool{
 	".mkv": true, ".mp4": true, ".m4v": true, ".avi": true,
 	".mov": true, ".ts": true, ".webm": true, ".wmv": true,
 	".mpg": true, ".mpeg": true,
@@ -71,7 +71,14 @@ func (s *Service) importCompletedTorrent(approval *ReleaseApproval, torrent *qbm
 		return nil, fmt.Errorf("qBittorrent returned no files for this torrent")
 	}
 
+	videoCount := 0
+	for _, content := range contents {
+		if content != nil && content.Progress >= 0.9999 && videoExtensions[strings.ToLower(filepath.Ext(content.Name))] {
+			videoCount++
+		}
+	}
 	imported := make([]string, 0, len(contents))
+	importedVideos := make([]struct{ source, destination string }, 0, videoCount)
 	for _, content := range contents {
 		if content == nil || content.Progress < 0.9999 || !videoExtensions[strings.ToLower(filepath.Ext(content.Name))] {
 			continue
@@ -85,7 +92,7 @@ func (s *Service) importCompletedTorrent(approval *ReleaseApproval, torrent *qbm
 		}
 
 		parsed := anime.NewLocalFileS(source, []string{torrent.SavePath})
-		episode := approval.EpisodeNumber
+		episode := 0
 		season := approval.SeasonNumber
 		if parsed != nil && parsed.ParsedData != nil {
 			if n, err := strconv.Atoi(strings.TrimSpace(parsed.ParsedData.Episode)); err == nil && n > 0 {
@@ -95,8 +102,11 @@ func (s *Service) importCompletedTorrent(approval *ReleaseApproval, torrent *qbm
 				season = n
 			}
 		}
+		if episode <= 0 && videoCount == 1 {
+			episode = approval.EpisodeNumber
+		}
 		if episode <= 0 {
-			return imported, fmt.Errorf("could not determine episode number for %s; provide episodeNumber in the approval", filepath.Base(source))
+			return imported, fmt.Errorf("could not determine episode number for %s; provide episodeNumber or use a release with parseable episode numbering", filepath.Base(source))
 		}
 		if season < 0 {
 			season = 1
@@ -116,6 +126,39 @@ func (s *Service) importCompletedTorrent(approval *ReleaseApproval, torrent *qbm
 			return imported, err
 		}
 		imported = append(imported, destination)
+		importedVideos = append(importedVideos, struct{ source, destination string }{source: source, destination: destination})
+	}
+
+	// Copy matching external subtitle sidecars alongside each imported video.
+	// Keep language suffixes such as ".en.ass" so Jellyfin can identify the track.
+	for _, content := range contents {
+		if content == nil || content.Progress < 0.9999 || !subtitleExtensions[strings.ToLower(filepath.Ext(content.Name))] {
+			continue
+		}
+		subtitleSource, err := torrentSourcePath(torrent, content.Name)
+		if err != nil {
+			return imported, err
+		}
+		for _, video := range importedVideos {
+			if filepath.Dir(subtitleSource) != filepath.Dir(video.source) {
+				continue
+			}
+			videoStem := strings.TrimSuffix(filepath.Base(video.source), filepath.Ext(video.source))
+			subtitleBase := filepath.Base(subtitleSource)
+			if subtitleBase != videoStem && !strings.HasPrefix(subtitleBase, videoStem+".") {
+				continue
+			}
+			suffix := strings.TrimPrefix(subtitleBase, videoStem)
+			if suffix == "" {
+				suffix = filepath.Ext(subtitleSource)
+			}
+			destination := strings.TrimSuffix(video.destination, filepath.Ext(video.destination)) + suffix
+			if err := copyFileWithoutOverwrite(subtitleSource, destination); err != nil {
+				return imported, err
+			}
+			imported = append(imported, destination)
+			break
+		}
 	}
 	if len(imported) == 0 {
 		return nil, fmt.Errorf("torrent has no completed video files to import")
@@ -128,19 +171,30 @@ func torrentSourcePath(torrent *qbmodel.Torrent, relativeName string) (string, e
 	if filepath.IsAbs(name) || name == "." || name == ".." || strings.HasPrefix(name, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("unsafe qBittorrent content path %q", relativeName)
 	}
-	base := torrent.ContentPath
-	if base == "" {
-		base = torrent.SavePath
+	bases := []string{}
+	if torrent.SavePath != "" {
+		bases = append(bases, torrent.SavePath)
 	}
-	if info, err := os.Stat(base); err == nil && info.Mode().IsRegular() {
-		return base, nil
+	if torrent.ContentPath != "" {
+		if info, err := os.Stat(torrent.ContentPath); err == nil && info.Mode().IsRegular() {
+			return torrent.ContentPath, nil
+		}
+		bases = append(bases, torrent.ContentPath)
 	}
-	source := filepath.Join(base, name)
-	rel, err := filepath.Rel(filepath.Clean(base), filepath.Clean(source))
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", fmt.Errorf("torrent file escapes its content directory")
+	for _, base := range bases {
+		candidate := filepath.Join(base, name)
+		rel, err := filepath.Rel(filepath.Clean(base), filepath.Clean(candidate))
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		if info, err := os.Stat(candidate); err == nil && info.Mode().IsRegular() {
+			return candidate, nil
+		}
 	}
-	return source, nil
+	if len(bases) > 0 {
+		return filepath.Join(bases[0], name), nil
+	}
+	return "", fmt.Errorf("qBittorrent did not provide a usable content path")
 }
 
 func (s *Service) jellyfinSeasonDirectory(series JellyfinSeries, season int) (string, error) {
