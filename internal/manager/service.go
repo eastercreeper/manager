@@ -19,7 +19,6 @@ import (
 
  "github.com/labstack/echo/v4"
  "github.com/rs/zerolog"
- qbmodel "seanime/internal/torrent_clients/qbittorrent/model"
  "gorm.io/gorm"
 )
 
