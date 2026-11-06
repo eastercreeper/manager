@@ -296,7 +296,7 @@ class JellyfinClient:
         if not self.url or not self.api_key:
             raise RuntimeError("Jellyfin is not configured")
         headers = kwargs.pop("headers", {})
-        headers["X-Emby-Token"] = self.api_key
+        headers["Authorization"] = f'MediaBrowser Token="{self.api_key}"'
         headers.setdefault("Accept", "application/json")
         response = requests.request(method, self.url + path, headers=headers, timeout=20, **kwargs)
         response.raise_for_status()
