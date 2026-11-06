@@ -15,13 +15,15 @@ COPY --from=web-build /src/web ./web
 RUN CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o /out/anime-manager .
 
 FROM debian:bookworm-slim
+ARG APP_UID=10001
+ARG APP_GID=10001
 ENV SEANIME_SERVER_HOST=0.0.0.0 \
     SEANIME_SERVER_PORT=8787 \
     SEANIME_DATA_DIR=/data
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg tini \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 10001 appgroup \
-    && useradd --uid 10001 --gid appgroup --create-home --shell /usr/sbin/nologin appuser \
+    && groupadd --gid "${APP_GID}" appgroup \
+    && useradd --uid "${APP_UID}" --gid appgroup --create-home --shell /usr/sbin/nologin appuser \
     && mkdir -p /data && chown -R appuser:appgroup /data
 WORKDIR /app
 COPY --from=go-build /out/anime-manager /app/anime-manager
