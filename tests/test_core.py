@@ -6,6 +6,7 @@ import subprocess
 import pytest
 
 from app import main
+from fastapi.testclient import TestClient
 
 
 def test_safe_folder_rejects_traversal():
@@ -505,6 +506,116 @@ def test_custom_folder_survives_jellyfin_sync(tmp_path, monkeypatch):
         row = conn.execute("SELECT folder_name,jellyfin_id FROM anime").fetchone()
     assert row["folder_name"] == "Custom Folder"
     assert row["jellyfin_id"] == "series-1"
+
+
+def test_first_visit_login_and_authenticated_post_csrf_flow(monkeypatch):
+    monkeypatch.setattr(main, "ADMIN_PASSWORD", "test-password")
+    monkeypatch.setattr(main, "SESSION_SECRET", "s" * 32)
+    monkeypatch.setattr(main, "sync_jellyfin", lambda: 0)
+    client = TestClient(main.app)
+
+    login_page = client.get("/login")
+    assert login_page.status_code == 200
+    cookie_token = client.cookies.get(main.CSRF_COOKIE)
+    form_token = re.search(
+        r'name="csrf_token" value="([^"]+)"', login_page.text
+    ).group(1)
+    assert cookie_token == form_token
+
+    login = client.post("/login", data={"password": "test-password", "csrf_token": form_token}, follow_redirects=False)
+    assert login.status_code == 303
+    assert client.cookies.get(main.SESSION_COOKIE)
+
+    dashboard = client.get("/")
+    assert dashboard.status_code == 200
+    csrf = client.cookies.get(main.CSRF_COOKIE)
+    sync = client.post("/library/sync", data={"csrf_token": csrf}, follow_redirects=False)
+    assert sync.status_code == 303
+
+    rejected = client.post("/library/sync", data={"csrf_token": "wrong"}, follow_redirects=False)
+    assert rejected.status_code == 403
+
+
+def test_scan_series_files_uses_safe_episode_parser(tmp_path):
+    (tmp_path / "Show - S01E01 [1080p][x265].mkv").write_bytes(b"")
+    (tmp_path / "Show - 01x02 [720p].mkv").write_bytes(b"")
+    (tmp_path / "Show - 2024 1080p x265.mkv").write_bytes(b"")
+    (tmp_path / "Show - 12 13.mkv").write_bytes(b"")
+    scanned = main.scan_series_files(tmp_path)
+    assert (1, 1) in scanned
+    assert (1, 2) in scanned
+    assert all(path.name != "Show - 2024 1080p x265.mkv" for path in scanned.values())
+    assert all(path.name != "Show - 12 13.mkv" for path in scanned.values())
+
+
+def test_tracking_preserves_alternate_titles_and_matches_provider_pairs(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "db.sqlite3"))
+    monkeypatch.setattr(main, "DATA_DIR", tmp_path)
+    with main.db() as conn:
+        first = conn.execute(
+            "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at,folder_locked) VALUES(?,?,?,?,?,1)",
+            ("Existing", "Custom Folder", "Existing", main.now(), main.now()),
+        ).lastrowid
+        conn.execute("INSERT INTO provider_ids(anime_id,provider,value) VALUES(?,?,?)", (first, "mal", "wrong"))
+        other = conn.execute(
+            "INSERT INTO anime(title,folder_name,search_query,created_at,updated_at,folder_locked) VALUES(?,?,?,?,?,1)",
+            ("Other", "Other", "Other", main.now(), main.now()),
+        ).lastrowid
+        conn.execute("INSERT INTO provider_ids(anime_id,provider,value) VALUES(?,?,?)", (other, "anilist", "42"))
+        conn.commit()
+
+    response = main.add_anime(
+        title="New Title", folder_name="New Custom", metadata_json='{"genres":["anime"]}',
+        provider_ids='{"mal":"42","anilist":"999"}', alternate_titles="日本語タイトル\nRomanized",
+        jellyfin_id="jf-1", year="2025",
+    )
+    assert response.status_code == 303
+    with main.db() as conn:
+        assert conn.execute("SELECT count(*) FROM anime").fetchone()[0] == 3
+
+    main.add_anime(
+        title="Existing", folder_name="Should Not Replace", metadata_json='{"overview":"added"}',
+        provider_ids='{"mal":"123"}', alternate_titles="Alias", jellyfin_id="", year="",
+    )
+    with main.db() as conn:
+        row = conn.execute("SELECT folder_name,metadata_json FROM anime WHERE title='Existing'").fetchone()
+        assert row["folder_name"] == "Custom Folder"
+        assert "overview" in row["metadata_json"]
+        assert conn.execute("SELECT title FROM alternate_titles WHERE anime_id=?", (first,)).fetchone()["title"] == "Alias"
+
+
+def test_runtime_permission_diagnostics_name_exact_failing_path(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    qbit_dir = tmp_path / "downloads" / "anime"
+    library_dir = tmp_path / "ivan" / "Shows"
+    library_dir.mkdir(parents=True)
+    monkeypatch.setattr(main, "DATA_DIR", data_dir)
+    monkeypatch.setattr(main, "QBT_SAVE_PATH", qbit_dir)
+    monkeypatch.setattr(main, "LIBRARY_DIR", library_dir)
+    main.ensure_runtime_paths()
+    assert not list(data_dir.glob(".anime-manager-write-test-*"))
+    assert not list(qbit_dir.glob(".anime-manager-write-test-*"))
+    assert not list(library_dir.glob(".anime-manager-write-test-*"))
+
+    bad_data = tmp_path / "not-a-directory"
+    bad_data.write_text("file")
+    monkeypatch.setattr(main, "DATA_DIR", bad_data)
+    with pytest.raises(RuntimeError, match=re.escape(str(bad_data))):
+        main.ensure_runtime_paths()
+
+
+def test_scan_series_files_rejects_symlinked_media(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    media = outside / "Show - S01E01.mkv"
+    media.write_bytes(b"")
+    library = tmp_path / "library"
+    library.mkdir()
+    link = library / "Show - S01E01.mkv"
+    link.symlink_to(media)
+    scanned = main.scan_series_files(library)
+    assert scanned == {}
+    assert not main.path_is_within(library, link)
 
 
 def test_release_search_persists_candidates_for_selected_anime(tmp_path, monkeypatch):

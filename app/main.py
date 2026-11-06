@@ -98,7 +98,7 @@ async def security_middleware(request: Request, call_next):
                 return HTMLResponse("Invalid CSRF token", status_code=403)
             request._body = body
     response = await call_next(request)
-    if ADMIN_PASSWORD and not request.cookies.get(CSRF_COOKIE):
+    if ADMIN_PASSWORD and not request.cookies.get(CSRF_COOKIE) and CSRF_COOKIE not in response.headers.get("set-cookie", ""):
         response.set_cookie(CSRF_COOKIE, secrets.token_urlsafe(32), httponly=False, samesite="strict", secure=SECURE_COOKIES)
     return response
 
@@ -113,23 +113,31 @@ def path_is_within(root: Path, candidate: Path) -> bool:
 
 
 def ensure_runtime_paths() -> None:
-    paths = (DATA_DIR, QBT_SAVE_PATH)
-    for path in paths:
+    for path in (DATA_DIR, QBT_SAVE_PATH):
         try:
             path.mkdir(parents=True, exist_ok=True)
-            probe = path / ".anime-manager-write-test"
-            probe.touch(exist_ok=False)
+            probe = path / f".anime-manager-write-test-{secrets.token_hex(8)}"
+            probe.touch()
             probe.unlink()
         except OSError as exc:
             raise RuntimeError(
-                f"Anime Manager cannot write to {path}; configure TrueNAS ACLs or APP_UID/APP_GID. "
+                f"Anime Manager cannot write to {path}; grant the configured APP_UID/APP_GID write ACL access. "
                 f"Refusing to run with elevated privileges: {exc}"
             ) from exc
-    if LIBRARY_DIR.exists() and not os.access(LIBRARY_DIR, os.W_OK):
+    if not LIBRARY_DIR.is_dir():
         raise RuntimeError(
-            f"Anime Manager cannot write to {LIBRARY_DIR}; configure TrueNAS ACLs or APP_UID/APP_GID. "
-            "Refusing to run with elevated privileges."
+            f"Anime Manager cannot write to {LIBRARY_DIR}; ensure the /ivan/Shows mount exists and "
+            "grant the configured APP_UID/APP_GID write ACL access. Refusing to run with elevated privileges."
         )
+    try:
+        probe = LIBRARY_DIR / f".anime-manager-write-test-{secrets.token_hex(8)}"
+        probe.touch()
+        probe.unlink()
+    except OSError as exc:
+        raise RuntimeError(
+            f"Anime Manager cannot write to {LIBRARY_DIR}; grant the configured APP_UID/APP_GID write ACL access. "
+            f"Refusing to run with elevated privileges: {exc}"
+        ) from exc
 
 
 def now() -> str:
@@ -261,16 +269,16 @@ def scan_series_files(series_path: Path) -> dict[tuple[int, int], Path]:
     files: dict[tuple[int, int], Path] = {}
     if not series_path.is_dir():
         return files
-    pattern = re.compile(r"(?:s(\d{1,2})\s*e(\d{1,3})|\b(\d{1,3})\b)", re.IGNORECASE)
     for path in series_path.rglob("*"):
         if not path.is_file() or path.suffix.lower() not in VIDEO_SUFFIXES:
             continue
-        match = pattern.search(path.stem)
-        if not match:
+        if not path_is_within(series_path, path):
             continue
-        season = int(match.group(1) or 1)
-        episode = int(match.group(2) or match.group(3))
-        files.setdefault((season, episode), path)
+        season, episodes = parse_file_episodes(path)
+        if not episodes:
+            continue
+        for episode in episodes:
+            files.setdefault((season, episode), path)
     return files
 
 
@@ -686,6 +694,13 @@ def sync_jellyfin() -> int:
                     "SELECT id FROM anime WHERE lower(title)=lower(?) OR lower(folder_name)=lower(?) "
                     "ORDER BY jellyfin_id IS NULL DESC LIMIT 1", (title, folder)
                 ).fetchone()
+            if not row and provider_ids:
+                provider_match = " OR ".join("(p.provider=? AND p.value=?)" for _ in provider_ids)
+                row = conn.execute(
+                    f"""SELECT DISTINCT a.id FROM anime a JOIN provider_ids p ON p.anime_id=a.id
+                        WHERE {provider_match} LIMIT 1""",
+                    tuple(value for pair in provider_ids.items() for value in pair),
+                ).fetchone()
             if row:
                 anime_id = row["id"]
                 current = conn.execute("SELECT folder_locked,folder_name FROM anime WHERE id=?", (anime_id,)).fetchone()
@@ -755,10 +770,17 @@ def search_anime(query: str) -> list[dict]:
     try:
         for item in JellyfinClient().search(query):
             provider_ids = item.get("ProviderIds") or {}
+            alternate_titles = list(item.get("AlternateTitles") or [])
+            alternate_titles.extend(value for value in (item.get("OriginalTitle"), item.get("SortName")) if value)
+            alternate_titles = [
+                value if isinstance(value, str) else value.get("Title", "")
+                for value in alternate_titles
+            ]
             results[f"jf:{item.get('Id')}"] = {
                 "title": item.get("Name", ""), "folder_name": Path(item.get("Path", "")).name or item.get("Name", ""),
                 "year": (item.get("PremiereDate") or "")[:4], "jellyfin_id": item.get("Id"),
                 "metadata_json": json.dumps(item), "provider_ids": provider_ids,
+                "alternate_titles": "\n".join(dict.fromkeys(t for t in alternate_titles if t)),
             }
     except (RuntimeError, ValueError, requests.RequestException):
         pass
@@ -1034,12 +1056,31 @@ def add_anime(title: str = Form(...), folder_name: str = Form(""),
             (title, folder_name),
         ).fetchone()
         if not existing and providers:
-            placeholders = ",".join("?" for _ in providers)
+            provider_match = " OR ".join("(p.provider=? AND p.value=?)" for _ in providers)
             existing = conn.execute(
                 f"""SELECT DISTINCT a.id FROM anime a JOIN provider_ids p ON p.anime_id=a.id
-                    WHERE p.provider IN ({placeholders}) AND p.value IN ({placeholders}) LIMIT 1""",
-                (*providers.keys(), *providers.values()),
+                    WHERE {provider_match} LIMIT 1""",
+                tuple(value for pair in providers.items() for value in pair),
             ).fetchone()
+        if existing:
+            anime_id = existing["id"]
+            current = conn.execute("SELECT jellyfin_id,year,metadata_json FROM anime WHERE id=?", (anime_id,)).fetchone()
+            try:
+                current_metadata = json.loads(current["metadata_json"] or "{}")
+            except ValueError:
+                current_metadata = {}
+            conn.execute(
+                """UPDATE anime SET jellyfin_id=COALESCE(jellyfin_id,?), year=COALESCE(year,?),
+                   metadata_json=?, updated_at=? WHERE id=?""",
+                (jellyfin_id or None, int(year) if year.isdigit() else None,
+                 json.dumps({**current_metadata, **metadata}), now(), anime_id),
+            )
+            for provider, value in providers.items():
+                conn.execute("INSERT OR IGNORE INTO provider_ids(anime_id,provider,value) VALUES(?,?,?)",
+                             (anime_id, str(provider), str(value)))
+            for alternate in [value.strip() for value in alternate_titles.split("\n") if value.strip()]:
+                conn.execute("INSERT OR IGNORE INTO alternate_titles(anime_id,title) VALUES(?,?)",
+                             (anime_id, alternate))
         if not existing:
             conn.execute("""INSERT INTO anime(title,folder_name,search_query,created_at,updated_at,folder_locked)
                 VALUES(?,?,?,?,?,1)""", (title, folder_name, title, now(), now()))
@@ -1079,7 +1120,7 @@ def search_page(q: str = "", release_q: str = "", anime_id: int = 0) -> HTMLResp
             releases = []
     body = template("""<div class="panel"><h2>Search anime</h2>
     <form method="get"><input name="q" value="{{q}}" placeholder="Japanese, English, or alternate title" size="45"><button>Search metadata</button></form>
-    <table><tr><th>Title</th><th>Year</th><th>Provider IDs</th><th>Action</th></tr>{% for item in anime_results %}<tr><td>{{item.title}}{% if item.folder_name and item.folder_name != item.title %}<br><span class="muted">{{item.folder_name}}</span>{% endif %}</td><td>{{item.year or ''}}</td><td>{{item.provider_ids or ''}}</td><td><form method="post" action="/anime"><input type="hidden" name="title" value="{{item.title}}"><input type="hidden" name="metadata_json" value="{{item.metadata_json or '{}'}}"><input type="hidden" name="provider_ids" value="{{item.provider_ids or '{}'}}"><input type="hidden" name="jellyfin_id" value="{{item.jellyfin_id or ''}}"><input type="hidden" name="year" value="{{item.year or ''}}"><input name="folder_name" placeholder="Custom folder name"><button>Track anime</button></form></td></tr>{% else %}<tr><td colspan="4">No metadata matches.</td></tr>{% endfor %}</table></div>
+    <table><tr><th>Title</th><th>Year</th><th>Provider IDs</th><th>Action</th></tr>{% for item in anime_results %}<tr><td>{{item.title}}{% if item.folder_name and item.folder_name != item.title %}<br><span class="muted">{{item.folder_name}}</span>{% endif %}</td><td>{{item.year or ''}}</td><td>{{item.provider_ids or ''}}</td><td><form method="post" action="/anime"><input type="hidden" name="title" value="{{item.title}}"><input type="hidden" name="metadata_json" value="{{item.metadata_json or '{}'}}"><input type="hidden" name="provider_ids" value="{{item.provider_ids or '{}'}}"><input type="hidden" name="alternate_titles" value="{{item.alternate_titles or ''}}"><input type="hidden" name="jellyfin_id" value="{{item.jellyfin_id or ''}}"><input type="hidden" name="year" value="{{item.year or ''}}"><input name="folder_name" placeholder="Custom folder name"><button>Track anime</button></form></td></tr>{% else %}<tr><td colspan="4">No metadata matches.</td></tr>{% endfor %}</table></div>
     <div class="panel"><h2>Search releases</h2><form method="get"><input name="release_q" value="{{release_q}}" placeholder="Title or identifier" size="45"><select name="anime_id" required><option value="">Track releases for...</option>{% for anime in tracked %}<option value="{{anime.id}}" {% if anime.id == anime_id %}selected{% endif %}>{{anime.title}}</option>{% endfor %}</select><button>Search Nyaa and TsukiHime</button></form>
     <table><tr><th>Release</th><th>Source</th><th>Quality</th><th>Audio/subtitles</th><th>Seeders</th><th>Score</th><th>Action</th></tr>{% for r in releases %}<tr><td><a href="/releases/{{r.id}}">{{r.title}}</a></td><td>{{r.source}}</td><td>{{r.quality}}</td><td>{{r.audio_hint}} / {{r.subtitle_hint}}</td><td>{{r.seeders}}</td><td>{{"%.1f"|format(r.score)}}<br><span class="muted">{{r.score_reason}}</span></td><td><form class="inline" method="post" action="/releases/{{r.id}}/approve"><button>Approve</button></form><form class="inline" method="post" action="/releases/{{r.id}}/reject"><button class="danger">Reject</button></form></td></tr>{% else %}<tr><td colspan="7">No release matches.</td></tr>{% endfor %}</table></div>""").render(
         q=q, release_q=release_q, anime_id=anime_id, tracked=tracked, anime_results=anime_results, releases=releases)
