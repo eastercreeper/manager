@@ -2,7 +2,7 @@
 
 A standalone Jellyfin-focused anime management application built by adapting the actual Go backend of [Seanime](https://github.com/5rahim/seanime).
 
-**Status: core rewrite and the two previously missing workflows are implemented on the feature branch; CI validation is running.** This branch is not production-deployed. The previous Python application and its database are intentionally not being migrated.
+**Status: implementation complete on the feature branch; the full CI pipeline passed for commit `850e183`.** A final importer safety improvement is being revalidated. This branch is not production-deployed. The previous Python application and its database are intentionally not being migrated.
 
 ## Design rules
 
@@ -33,4 +33,4 @@ This project must preserve applicable GPL-3.0-or-later notices, identify modific
 - The Dockerfile builds the upstream React frontend, embeds it in the Go binary, and packages one runtime image.
 - `.env.example`, `compose.example.yaml`, and `docs/MANAGER_API.md` describe configuration and endpoints.
 
-CI validates frontend build, Go tests, full Go application build, vet, and Docker image build. For imports, mount the Jellyfin media path read-write at the same absolute path Jellyfin reports, and make qBittorrent's completed download path visible inside the manager container. No production deployment or existing data has been changed.
+CI validates the frontend build, Go tests, full Go application build, `go vet`, and Docker image build. The most recent fully green run is [run 42270531493](https://github.com/eastercreeper/manager/actions/runs/42270531493). For imports, mount the Jellyfin media path read-write at the same absolute path Jellyfin reports, and make qBittorrent's completed download path visible inside the manager container. No production deployment or existing data has been changed.
