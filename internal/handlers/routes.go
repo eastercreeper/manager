@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"seanime/internal/core"
+	"seanime/internal/manager"
 	util "seanime/internal/util/proxies"
 	"strings"
 	"time"
@@ -613,6 +614,7 @@ func InitRoutes(app *core.App, e *echo.Echo) {
 	v1CustomSource.POST("/provider/list/anime", h.HandleCustomSourceListAnime)
 	v1CustomSource.POST("/provider/list/manga", h.HandleCustomSourceListManga)
 
+	manager.Register(app, v1)
 }
 
 func (h *Handler) JSON(c echo.Context, code int, i interface{}) error {
