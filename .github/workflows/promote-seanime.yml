@@ -1,0 +1,47 @@
+name: Promote Seanime into application root
+
+on:
+  push:
+    branches:
+      - rewrite/go-backend
+
+permissions:
+  contents: write
+
+concurrency:
+  group: seanime-promote-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: contains(github.event.head_commit.message, '[promote-seanime]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream/seanime/go.mod
+          cache: false
+      - name: Promote upstream source
+        run: bash .github/scripts/promote-seanime.sh
+      - name: Verify root module and Jellyfin package
+        run: |
+          test -s go.mod
+          test -s main.go
+          test -s LICENSE
+          go version
+          go test ./internal/jellyfin/...
+      - name: Commit promoted application
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Root already contains the promoted application."
+            exit 0
+          fi
+          git commit -m "Promote Seanime Go application as manager foundation [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
