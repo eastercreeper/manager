@@ -93,6 +93,25 @@ func (s *Service) installScannerMappingHook() {
 			return resolver.Next()
 		}
 		applySeriesOverrides(event.LocalFiles, shows)
+		// Persist Seanime's native matcher results back to Jellyfin records.
+		// Existing mappings without a source are treated as manual for safety.
+		for _, show := range shows {
+			if show.MappingSource == "manual" || (show.AniListID > 0 && show.MappingSource == "") {
+				continue
+			}
+			ids := matchedMediaIDsForPath(event.LocalFiles, show.Path)
+			if len(ids) == 1 {
+				for id := range ids {
+					if id > 0 && id != show.AniListID {
+						if err := s.db.Model(&JellyfinSeries{}).Where("jellyfin_id = ? AND (mapping_source = '' OR mapping_source = 'auto')", show.JellyfinID).Updates(map[string]any{"ani_list_id": id, "mapping_source": "auto"}).Error; err != nil {
+							s.app.Logger.Error().Err(err).Str("jellyfinId", show.JellyfinID).Msg("manager: persist Seanime AniList match")
+						}
+					} else if id > 0 && show.MappingSource != "auto" {
+						_ = s.db.Model(&JellyfinSeries{}).Where("jellyfin_id = ? AND (mapping_source = '' OR mapping_source = 'auto')", show.JellyfinID).Update("mapping_source", "auto").Error
+					}
+				}
+			}
+		}
 		return resolver.Next()
 	})
 }
@@ -122,4 +141,24 @@ func applySeriesOverrides(localFiles []*anime.LocalFile, shows []JellyfinSeries)
 			}
 		}
 	}
+}
+
+
+// matchedMediaIDsForPath returns the distinct non-zero AniList IDs assigned by
+// Seanime to files beneath one Jellyfin series directory.
+func matchedMediaIDsForPath(localFiles []*anime.LocalFile, seriesPath string) map[int]bool {
+	ids := make(map[int]bool)
+	if strings.TrimSpace(seriesPath) == "" { return ids }
+	root, err := filepath.Abs(filepath.Clean(seriesPath))
+	if err != nil { return ids }
+	for _, localFile := range localFiles {
+		if localFile == nil || localFile.MediaId <= 0 { continue }
+		filePath, err := filepath.Abs(filepath.Clean(localFile.Path))
+		if err != nil { continue }
+		rel, err := filepath.Rel(root, filePath)
+		if err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			ids[localFile.MediaId] = true
+		}
+	}
+	return ids
 }
