@@ -1035,12 +1035,12 @@ def anilist_sequel_candidates(media: dict) -> list[dict]:
 
 def resolve_anilist_chain(root: dict) -> tuple[list[dict], bool]:
     """Follow only unambiguous TV sequel links; do not guess across franchise branches."""
-    root_tokens = set(re.findall(r"[a-z0-9]+", normalize_title(" ".join(anilist_titles(root)))))
+    root_tokens = set(re.findall(r"[a-z0-9]+", " ".join(anilist_titles(root)).lower()))
     chain, seen, current = [root], {int(root["id"])}, root
     for _ in range(8):
         candidates = []
         for item in anilist_sequel_candidates(current):
-            tokens = set(re.findall(r"[a-z0-9]+", normalize_title(" ".join(anilist_titles(item)))))
+            tokens = set(re.findall(r"[a-z0-9]+", " ".join(anilist_titles(item)).lower()))
             similarity = len(root_tokens & tokens) / len(root_tokens) if root_tokens else 0
             if int(item.get("id") or 0) not in seen and similarity >= 0.60:
                 candidates.append(item)
@@ -1483,6 +1483,10 @@ def add_anime(title: str = Form(...), folder_name: str = Form(""),
                 (jellyfin_id or None, int(year) if year.isdigit() else None,
                  json.dumps({**current_metadata, **metadata}), now(), anime_id),
             )
+            if any(str(provider).lower() == "anilist" for provider in providers):
+                conn.execute("DELETE FROM provider_ids WHERE anime_id=? AND lower(provider)='anilist'", (anime_id,))
+                conn.execute("DELETE FROM expected_seasons WHERE anime_id=?", (anime_id,))
+                conn.execute("DELETE FROM metadata_sync WHERE anime_id=?", (anime_id,))
             for provider, value in providers.items():
                 conn.execute("INSERT OR IGNORE INTO provider_ids(anime_id,provider,value) VALUES(?,?,?)",
                              (anime_id, str(provider), str(value)))
