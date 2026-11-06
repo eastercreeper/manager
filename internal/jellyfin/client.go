@@ -43,6 +43,7 @@ type Item struct {
 	Name string `json:"Name"`
 	Type string `json:"Type"`
 	SeriesID string `json:"SeriesId,omitempty"`
+	SeriesName string `json:"SeriesName,omitempty"`
 	Path string `json:"Path,omitempty"`
 	IndexNumber *int `json:"IndexNumber,omitempty"`
 	ParentIndexNumber *int `json:"ParentIndexNumber,omitempty"`
@@ -98,4 +99,16 @@ func (c *Client) ListSeries(ctx context.Context, pageSize int) ([]Item, error) {
 		all = append(all, page.Items...)
 		if len(page.Items) == 0 || start+len(page.Items) >= page.TotalRecordCount { return all, nil }
 	}
+}
+
+ 
+// ListEpisodes returns the physical episode files belonging to a Jellyfin series.
+func (c *Client) ListEpisodes(ctx context.Context, seriesID string) ([]Item, error) {
+ q := url.Values{"Fields": {"Path"}, "IsMissing": {"false"}}
+ var response ItemsResponse
+ if err := c.get(ctx, "/Shows/"+url.PathEscape(seriesID)+"/Episodes", q, &response); err != nil {
+  return nil, err
+ }
+ for i := range response.Items { response.Items[i].SeriesID = seriesID }
+ return response.Items, nil
 }
