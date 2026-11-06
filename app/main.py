@@ -1149,19 +1149,20 @@ def exact_anilist_match(show: sqlite3.Row, aliases: list[str]) -> tuple[Optional
     return exact[0], ""
 
 
-def _refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
+def _refresh_anilist_expectations(limit: int = 3, force: bool = False, anime_id: Optional[int] = None) -> int:
     """Match tracked anime to AniList and map linked TV sequels onto Jellyfin seasons."""
     cutoff = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0).isoformat()
     retry_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=ANILIST_RETRY_COOLDOWN_MINUTES)).isoformat()
     with DB_LOCK, closing(db()) as conn:
         shows = conn.execute("""SELECT a.* FROM anime a LEFT JOIN metadata_sync m ON m.anime_id=a.id
-            WHERE ?=1 OR m.anime_id IS NULL OR
+            WHERE (?=1 OR m.anime_id IS NULL OR
               ((m.status IN ('rate_limited','retryable_error') OR
                 (m.status='error' AND m.message LIKE '%429%')) AND m.checked_at < ?) OR
               (m.status NOT IN ('matched','needs_review','rate_limited','retryable_error') AND
-                NOT (m.status='error' AND m.message LIKE '%429%') AND m.checked_at < ?)
+                NOT (m.status='error' AND m.message LIKE '%429%') AND m.checked_at < ?))
+              AND (? IS NULL OR a.id=?)
             ORDER BY CASE WHEN m.status IN ('matched','needs_review') THEN 1 ELSE 0 END,a.id LIMIT ?""",
-            (int(force), retry_cutoff, cutoff, max(1, int(limit)))).fetchall()
+            (int(force), retry_cutoff, cutoff, anime_id, anime_id, max(1, int(limit)))).fetchall()
     refreshed = 0
     for show in shows:
         anime_id = int(show["id"])
@@ -1250,12 +1251,12 @@ def _refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
     return refreshed
 
 
-def refresh_anilist_expectations(limit: int = 3, force: bool = False) -> int:
+def refresh_anilist_expectations(limit: int = 3, force: bool = False, anime_id: Optional[int] = None) -> int:
     """Prevent scheduler and manual requests from running metadata refresh concurrently."""
     if not ANILIST_REFRESH_LOCK.acquire(blocking=False):
         return 0
     try:
-        return _refresh_anilist_expectations(limit=limit, force=force)
+        return _refresh_anilist_expectations(limit=limit, force=force, anime_id=anime_id)
     finally:
         ANILIST_REFRESH_LOCK.release()
 
@@ -1658,6 +1659,89 @@ def sync() -> RedirectResponse:
 
 
 
+@app.get("/metadata/select/{anime_id}", response_class=HTMLResponse)
+def metadata_select_page(anime_id: int, q: str = "") -> HTMLResponse:
+    with closing(db()) as conn:
+        show = conn.execute("SELECT id,title FROM anime WHERE id=?", (anime_id,)).fetchone()
+        current = conn.execute("""SELECT value FROM provider_ids
+            WHERE anime_id=? AND lower(provider)='anilist' LIMIT 1""", (anime_id,)).fetchone()
+    if not show:
+        raise HTTPException(404, "Anime not found")
+    query = q.strip() or show["title"]
+    candidates = []
+    error = ""
+    try:
+        for item in search_external_anime(query):
+            metadata = json.loads(item.get("metadata_json") or "{}")
+            item["anilist_id"] = str((item.get("provider_ids") or {}).get("AniList") or "")
+            item["episodes"] = metadata.get("episodes") or "—"
+            candidates.append(item)
+    except (requests.RequestException, RuntimeError, ValueError) as exc:
+        error = str(exc)
+    body = template("""<div class="panel">
+        <h2>Select AniList match: {{show.title}}</h2>
+        <p class="muted">Current AniList ID: {{current_id or "none"}}. Selecting a result updates this tracked anime; it does not create another library entry.</p>
+        <form method="get" action="/metadata/select/{{show.id}}">
+            <input name="q" value="{{query}}" placeholder="Search AniList by title" size="40">
+            <button>Search AniList</button>
+        </form>
+        {% if error %}<p class="muted">{{error}}</p>{% endif %}
+        <table><tr><th>Title</th><th>Japanese title</th><th>Year</th><th>Episodes</th><th>AniList ID</th><th>Action</th></tr>
+        {% for item in candidates %}
+        <tr><td>{{item.title}}</td><td>{{item.japanese_title or "—"}}</td><td>{{item.year or "—"}}</td>
+        <td>{{item.episodes}}</td><td>{{item.anilist_id}}</td><td>
+        <form class="inline" method="post" action="/metadata/select/{{show.id}}">
+            <input type="hidden" name="anilist_id" value="{{item.anilist_id}}">
+            <button type="submit">Select</button>
+        </form></td></tr>
+        {% else %}<tr><td colspan="6">No AniList results. Try another search or enter an ID below.</td></tr>{% endfor %}</table>
+    </div>
+    <div class="panel"><h2>Enter AniList ID manually</h2>
+        <form method="post" action="/metadata/select/{{show.id}}">
+            <input name="anilist_id" type="number" min="1" step="1" placeholder="AniList media ID" required>
+            <button>Save ID</button>
+        </form>
+        <p class="muted">The ID is checked against AniList before it is saved.</p>
+        <p><a href="/metadata">Back to Metadata</a></p>
+    </div>""").render(
+        show=show, current_id=current["value"] if current else "",
+        query=query, candidates=candidates, error=error)
+    return page(body)
+
+
+@app.post("/metadata/select/{anime_id}")
+def metadata_select_save(anime_id: int, anilist_id: str = Form(...)) -> RedirectResponse:
+    value = anilist_id.strip()
+    if not value.isdigit() or int(value) < 1:
+        raise HTTPException(400, "AniList ID must be a positive integer")
+    try:
+        media = anilist_media(int(value))
+    except (AniListRateLimitError, AniListTemporaryError, requests.RequestException, RuntimeError) as exc:
+        raise HTTPException(502, f"Could not verify AniList ID: {exc}") from exc
+    if not media:
+        raise HTTPException(404, "AniList did not return an anime for that ID")
+    with DB_LOCK, closing(db()) as conn:
+        if not conn.execute("SELECT 1 FROM anime WHERE id=?", (anime_id,)).fetchone():
+            raise HTTPException(404, "Anime not found")
+        duplicate = conn.execute("""SELECT a.title FROM provider_ids p
+            JOIN anime a ON a.id=p.anime_id
+            WHERE lower(p.provider)='anilist' AND p.value=? AND p.anime_id<>? LIMIT 1""",
+            (str(int(value)), anime_id)).fetchone()
+        if duplicate:
+            raise HTTPException(409, f"That AniList ID is already assigned to {duplicate['title']}")
+        conn.execute("DELETE FROM provider_ids WHERE anime_id=? AND lower(provider)='anilist'", (anime_id,))
+        conn.execute("INSERT INTO provider_ids(anime_id,provider,value) VALUES(?,?,?)",
+                     (anime_id, "AniList", str(int(value))))
+        conn.execute("DELETE FROM expected_seasons WHERE anime_id=?", (anime_id,))
+        conn.execute("DELETE FROM metadata_sync WHERE anime_id=?", (anime_id,))
+        conn.commit()
+    try:
+        refresh_anilist_expectations(limit=1, force=True, anime_id=anime_id)
+    except (RuntimeError, ValueError, requests.RequestException, sqlite3.Error) as exc:
+        raise HTTPException(502, f"AniList ID saved, but metadata refresh failed: {exc}") from exc
+    return RedirectResponse("/metadata", status_code=303)
+
+
 @app.get("/metadata", response_class=HTMLResponse)
 def metadata_page() -> HTMLResponse:
     with closing(db()) as conn:
@@ -1673,20 +1757,20 @@ def metadata_page() -> HTMLResponse:
                         WHERE anime_id=? AND season=? AND status='available' AND has_file=1
                         AND episode IS NOT NULL""", (show["id"],expected["season"])).fetchall()}
                     missing = sorted(set(range(1,int(expected["expected_count"])+1))-actual)
-                    rows.append({"title":show["title"],"season":expected["season"],
+                    rows.append({"anime_id":show["id"],"title":show["title"],"season":expected["season"],
                         "expected":expected["expected_count"],"actual":len(actual),
                         "missing":", ".join(map(str,missing[:30]))+("…" if len(missing)>30 else ""),
                         "status":"complete" if not missing else f"{len(missing)} missing",
                         "message":expected["metadata_title"]})
             else:
-                rows.append({"title":show["title"],"season":"—","expected":"—","actual":"—",
+                rows.append({"anime_id":show["id"],"title":show["title"],"season":"—","expected":"—","actual":"—",
                     "missing":"—","status":show["status"] or "not checked",
                     "message":show["message"] or "No AniList mapping yet"})
     body = template("""<div class="panel"><div class="row"><h2 style="flex:1">Episode reconciliation</h2>
         <form method="post" action="/metadata/refresh"><button>Refresh AniList matches</button></form></div>
         <p class="muted">Expected counts come from AniList. Actual episodes are read from Jellyfin and checked against files. Ambiguous mappings are not guessed.</p>
         <table><tr><th>Anime</th><th>Season</th><th>Expected</th><th>Present</th><th>Missing episode numbers</th><th>Status</th></tr>
-        {% for r in rows %}<tr><td>{{r.title}}</td><td>{{r.season}}</td><td>{{r.expected}}</td><td>{{r.actual}}</td><td>{{r.missing}}</td><td>{{r.status}}<br><span class="muted">{{r.message}}</span></td></tr>
+        {% for r in rows %}<tr><td>{{r.title}}<br><form class="inline" method="get" action="/metadata/select/{{r.anime_id}}"><button type="submit">Select AniList</button></form></td><td>{{r.season}}</td><td>{{r.expected}}</td><td>{{r.actual}}</td><td>{{r.missing}}</td><td>{{r.status}}<br><span class="muted">{{r.message}}</span></td></tr>
         {% else %}<tr><td colspan="6">No tracked anime.</td></tr>{% endfor %}</table></div>""").render(rows=rows)
     return page(body)
 
