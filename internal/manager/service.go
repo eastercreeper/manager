@@ -12,6 +12,7 @@ import (
  "time"
 
  "seanime/internal/core"
+ "seanime/internal/database/models"
  "seanime/internal/jellyfin"
  "seanime/internal/mediastream/videofile"
  qbittorrent "seanime/internal/torrent_clients/qbittorrent"
@@ -22,11 +23,11 @@ import (
  "gorm.io/gorm"
 )
 
-type Service struct { db *gorm.DB; jf *jellyfin.Client }
+type Service struct { app *core.App; db *gorm.DB; jf *jellyfin.Client }
 
 func Register(app *core.App, v1 *echo.Group) {
  if app == nil || app.Database == nil { return }
- s := &Service{db:app.Database.Gorm()}
+ s := &Service{app:app,db:app.Database.Gorm()}
  if err := s.db.AutoMigrate(&JellyfinSeries{},&JellyfinEpisode{},&ReleaseApproval{},&MediaVerification{}); err != nil {
   app.Logger.Error().Err(err).Msg("manager: extension schema migration failed"); return
  }
@@ -81,7 +82,24 @@ func (s *Service) syncJellyfin(c echo.Context) error {
    episodeCount++
   }
  }
- return c.JSON(200,map[string]any{"series":seriesCount,"episodes":episodeCount,"syncedAt":now})
+ // Point Seanime's own scanner at the folders Jellyfin reports. The scanner,
+ // AniList platform, metadata provider, and local-file cache remain upstream
+ // implementations; this extension only supplies Jellyfin's authoritative paths.
+ scanQueued:=false
+ if s.app.Settings!=nil && s.app.Settings.Library!=nil && s.app.AutoScanner!=nil {
+  paths:=make([]string,0,len(series));seen:=map[string]bool{}
+  for _,item:=range series { p:=filepath.Clean(strings.TrimSpace(item.Path));if filepath.IsAbs(p)&&!seen[p] { if st,e:=os.Stat(p);e==nil&&st.IsDir(){seen[p]=true;paths=append(paths,p)} } }
+  if len(paths)>0 {
+   s.app.Settings.Library.LibraryPath=paths[0]
+   s.app.Settings.Library.LibraryPaths=models.LibraryPaths(paths[1:])
+   if err:=s.db.Save(s.app.Settings).Error;err==nil {
+    s.app.AutoScanner.SetSettings(*s.app.Settings.Library)
+    go s.app.AutoScanner.RunNow()
+    scanQueued=true
+   } else { s.app.Logger.Error().Err(err).Msg("manager: could not persist Jellyfin scanner paths") }
+  }
+ }
+ return c.JSON(200,map[string]any{"series":seriesCount,"episodes":episodeCount,"syncedAt":now,"seanimeScanQueued":scanQueued})
 }
 func (s *Service) library(c echo.Context) error {
  var shows []JellyfinSeries;var eps []JellyfinEpisode
