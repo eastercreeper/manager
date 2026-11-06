@@ -2,7 +2,7 @@
 
 A standalone Jellyfin-focused anime management application built by adapting the actual Go backend of [Seanime](https://github.com/5rahim/seanime).
 
-**Status: Seanime root application and Jellyfin manager extensions implemented; CI validation in progress.** This branch is not production-deployed. The previous Python application and its database are intentionally not being migrated.
+**Status: core rewrite and the two previously missing workflows are implemented on the feature branch; CI validation is running.** This branch is not production-deployed. The previous Python application and its database are intentionally not being migrated.
 
 ## Design rules
 
@@ -26,9 +26,11 @@ This project must preserve applicable GPL-3.0-or-later notices, identify modific
 - Seanime's pinned Go application is promoted to the repository root and remains the sole application runtime.
 - Jellyfin series/episode synchronization is registered in Seanime's Echo API and uses Seanime's GORM/SQLite database.
 - Jellyfin paths configure Seanime's native anime scanner.
-- Manual AniList overrides, release approvals, qBittorrent handoff, completion reconciliation, and FFprobe subtitle verification are available through the manager extension.
+- Manual AniList overrides are applied inside Seanime's native scan-matching hook, including fetching mapped AniList media when it is not already in the scanner's candidate set.
+- Release approvals hand off to qBittorrent; completed torrents are copied into the selected Jellyfin series/season directory, with matching external subtitle sidecars. Original download files remain in place for seeding, and existing library files are never overwritten.
+- Import state and errors are persisted so a failed import can be retried; Jellyfin refresh and FFprobe subtitle verification remain available.
 - A lightweight dashboard is served at `/api/v1/manager/ui`.
 - The Dockerfile builds the upstream React frontend, embeds it in the Go binary, and packages one runtime image.
 - `.env.example`, `compose.example.yaml`, and `docs/MANAGER_API.md` describe configuration and endpoints.
 
-CI is validating frontend build, Go tests, full Go application build, vet, and Docker image build. No production deployment or existing data has been changed.
+CI validates frontend build, Go tests, full Go application build, vet, and Docker image build. For imports, mount the Jellyfin media path read-write at the same absolute path Jellyfin reports, and make qBittorrent's completed download path visible inside the manager container. No production deployment or existing data has been changed.
