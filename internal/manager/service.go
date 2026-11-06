@@ -119,11 +119,11 @@ func (s *Service) listApprovals(c echo.Context) error {
  var rows []ReleaseApproval;if err:=s.db.Order("created_at desc").Limit(500).Find(&rows).Error;err!=nil{return c.JSON(500,map[string]string{"error":err.Error()})};return c.JSON(200,rows)
 }
 func (s *Service) createApproval(c echo.Context) error {
- var b struct{Title string `json:"title"`;Link string `json:"link"`;MediaID int `json:"mediaId"`;EpisodeNumber int `json:"episodeNumber"`;SeasonNumber int `json:"seasonNumber"`;JellyfinSeriesID string `json:"jellyfinSeriesId"`;SavePath string `json:"savePath"`;Category string `json:"category"`}
+ var b struct{Title string `json:"title"`;Link string `json:"link"`;MediaID int `json:"mediaId"`;EpisodeNumber int `json:"episodeNumber"`;SeasonNumber *int `json:"seasonNumber"`;JellyfinSeriesID string `json:"jellyfinSeriesId"`;SavePath string `json:"savePath"`;Category string `json:"category"`}
  if c.Bind(&b)!=nil{return c.JSON(400,map[string]string{"error":"invalid JSON body"})}
  u,err:=url.Parse(strings.TrimSpace(b.Link));if err!=nil||(u.Scheme!="magnet"&&u.Scheme!="http"&&u.Scheme!="https"){return c.JSON(400,map[string]string{"error":"link must be magnet, HTTP, or HTTPS"})}
  if strings.TrimSpace(b.Title)==""||!filepath.IsAbs(b.SavePath){return c.JSON(400,map[string]string{"error":"title and absolute savePath are required"})}
- season:=b.SeasonNumber;if season==0{season=1};row:=ReleaseApproval{Title:b.Title,Link:b.Link,MediaID:b.MediaID,EpisodeNumber:b.EpisodeNumber,SeasonNumber:season,JellyfinSeriesID:strings.TrimSpace(b.JellyfinSeriesID),SavePath:filepath.Clean(b.SavePath),Category:b.Category,Status:"pending"}
+ season:=1;if b.SeasonNumber!=nil{season=*b.SeasonNumber};if season<0||season>99{return c.JSON(400,map[string]string{"error":"seasonNumber must be between 0 and 99"})};row:=ReleaseApproval{Title:b.Title,Link:b.Link,MediaID:b.MediaID,EpisodeNumber:b.EpisodeNumber,SeasonNumber:season,JellyfinSeriesID:strings.TrimSpace(b.JellyfinSeriesID),SavePath:filepath.Clean(b.SavePath),Category:b.Category,Status:"pending"}
  if err:=s.db.Create(&row).Error;err!=nil{return c.JSON(500,map[string]string{"error":err.Error()})};return c.JSON(201,row)
 }
 func (s *Service) qbClient() (*qbittorrent.Client,error) {
