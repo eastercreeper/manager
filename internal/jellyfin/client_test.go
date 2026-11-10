@@ -8,10 +8,10 @@ import (
 	"testing"
 )
 
-func TestSystemInfoAuthenticatesWithEmbyToken(t *testing.T) {
+func TestSystemInfoAuthenticatesWithMediaBrowserToken(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/System/Info" { t.Errorf("path = %q", r.URL.Path) }
-		if r.Header.Get("X-Emby-Token") != "secret" { t.Errorf("missing API token") }
+		if got := r.Header.Get("Authorization"); got != `MediaBrowser Token="secret"` { t.Errorf("Authorization = %q, want MediaBrowser token", got) }
 		_ = json.NewEncoder(w).Encode(SystemInfo{ServerName: "Jellyfin", Version: "10.10.7"})
 	}))
 	defer s.Close()
