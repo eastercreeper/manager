@@ -24,6 +24,20 @@ func TestApplySeriesOverridesUsesMostSpecificPath(t *testing.T) {
 	}
 }
 
+func TestApplySeriesOverridesUsesContainerScanPath(t *testing.T) {
+	root := t.TempDir()
+	local := &anime.LocalFile{Path: filepath.Join(root, "Season 01", "episode.mkv")}
+	shows := []JellyfinSeries{{
+		Path:     "/SMB/JP-BEAN/Shows/Example Anime",
+		ScanPath: root,
+		AniListID: 12345,
+	}}
+	applySeriesOverrides([]*anime.LocalFile{local}, shows)
+	if local.MediaId != 12345 {
+		t.Fatalf("mapped media ID = %d, want 12345 using ScanPath", local.MediaId)
+	}
+}
+
 func TestApplySeriesOverridesDoesNotMatchPathPrefixCollision(t *testing.T) {
 	root := t.TempDir()
 	local := &anime.LocalFile{Path: root + "-other/episode.mkv"}
