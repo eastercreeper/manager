@@ -1,0 +1,6 @@
+node_modules/
+dist/
+binaries/
+.DS_Store
+web-denshi/
+native-builds/
