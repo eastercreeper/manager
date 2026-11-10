@@ -123,7 +123,11 @@ func (s *Service) installScannerMappingHook() {
 }
 
 func applySeriesOverrides(localFiles []*anime.LocalFile, shows []JellyfinSeries) {
-	sort.Slice(shows, func(i, j int) bool { return len(shows[i].Path) > len(shows[j].Path) })
+	// Use the container-visible path, not Jellyfin's host path. Prefer the
+	// most-specific series root when library roots overlap.
+	sort.Slice(shows, func(i, j int) bool {
+		return len(seriesScanPath(shows[i])) > len(seriesScanPath(shows[j]))
+	})
 	for _, localFile := range localFiles {
 		if localFile == nil {
 			continue
@@ -133,10 +137,11 @@ func applySeriesOverrides(localFiles []*anime.LocalFile, shows []JellyfinSeries)
 			continue
 		}
 		for _, show := range shows {
-			if show.AniListID <= 0 || strings.TrimSpace(show.Path) == "" {
+			rootPath := strings.TrimSpace(seriesScanPath(show))
+			if show.AniListID <= 0 || rootPath == "" {
 				continue
 			}
-			root, err := filepath.Abs(filepath.Clean(show.Path))
+			root, err := filepath.Abs(filepath.Clean(rootPath))
 			if err != nil {
 				continue
 			}
