@@ -285,7 +285,8 @@ func (as *AutoScanner) scan() {
 	sc := scanner.Scanner{
 		DirPath:              settings.Library.LibraryPath,
 		OtherDirPaths:        settings.Library.LibraryPaths,
-		Enhanced:             false, // Do not use enhanced mode for auto scanner.
+		Enhanced:                   true, // Match local titles against AniList IDs beyond the user's collection.
+		EnhanceWithOfflineDatabase: true, // Use Seanime's cached anime-offline-database for broad, automatic matching.
 		PlatformRef:          as.platformRef,
 		Logger:               as.logger,
 		WSEventManager:       as.wsEventManager,
